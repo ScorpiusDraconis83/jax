@@ -12,28 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("@rules_python//python:defs.bzl", "py_library")
 load(
     "//jaxlib:jax.bzl",
     "py_deps",
 )
-load("@rules_python//python:defs.bzl", "py_library")
 
 package(
     default_applicable_licenses = [],
     default_visibility = [
-        "//:__subpackages__",
+        "//jax:internal",
     ],
 )
 
 py_library(
     name = "pallas",
-    srcs = glob(
-        include = ["**/*.py"],
-        exclude = [
-            "triton/*.py",
-            "mosaic/*.py",
-        ],
-    ),
+    srcs = [
+        "__init__.py",
+        "core.py",
+        "cost_estimate.py",
+        "helpers.py",
+        "pallas_call.py",
+        "primitives.py",
+        "utils.py",
+    ],
     deps = [
         "//jax",
         "//jax:ad_util",
@@ -45,22 +47,4 @@ py_library(
         "//jax:util",
         "//jax/_src/lib",
     ] + py_deps("numpy"),
-)
-
-py_library(
-    name = "gpu",
-    visibility = [],
-    deps = [
-        ":pallas",
-        "//jax/_src/pallas/triton",
-    ],
-)
-
-py_library(
-    name = "tpu",
-    visibility = [],
-    deps = [
-        ":pallas",
-        "//jax/_src/pallas/mosaic",
-    ],
 )

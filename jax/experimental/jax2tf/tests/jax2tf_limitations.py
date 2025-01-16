@@ -15,9 +15,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import itertools
-from typing import Any, Callable, Optional, Union
+from typing import Any
 
 import jax
 from jax import lax
@@ -198,6 +198,12 @@ class Jax2TfLimitation(test_harnesses.Limitation):
             devices=("cpu", "gpu"),
             tol=1e-13,
             modes=("eager", "graph", "compiled")),
+        custom_numeric(
+            dtypes=[np.complex64],
+            devices=("tpu",),
+            tol=1e-3,
+            modes=("eager", "graph", "compiled"),
+            native_serialization=Jax2TfLimitation.FOR_NON_NATIVE),
     ]
 
   @classmethod
@@ -206,7 +212,17 @@ class Jax2TfLimitation(test_harnesses.Limitation):
         custom_numeric(dtypes=[np.complex64], devices=("cpu", "gpu", "tpu"),
                        tol=1e-3),
         custom_numeric(dtypes=[np.complex128], devices=("cpu", "gpu"), tol=1e-12),
-        cls.helper_get_trig_custom_limitation(np.cosh)
+        Jax2TfLimitation(
+            "TF2XLA impl for Acosh doesn't properly handle large complex types,"
+            " native serialization more closely matches numpy numerics.",
+            dtypes=[np.complex64, np.complex128],
+            devices=("cpu", "gpu", "tpu"),
+            modes="compiled",
+            expect_tf_error=False,
+            skip_comparison=True,
+            native_serialization=Jax2TfLimitation.FOR_NON_NATIVE,
+        ),
+        cls.helper_get_trig_custom_limitation(np.cosh),
     ]
 
   @classmethod
@@ -281,6 +297,15 @@ class Jax2TfLimitation(test_harnesses.Limitation):
         custom_numeric(dtypes=[np.complex64], devices=("cpu", "gpu", "tpu"),
                        tol=1e-3),
         custom_numeric(dtypes=[np.complex128], devices=("cpu", "gpu"), tol=1e-12),
+        custom_numeric(dtypes=[np.complex64, np.complex128],
+                       devices=("cpu", "gpu", "tpu"),
+                       modes=("compiled",),
+                       tol=1e-3,
+                       native_serialization=Jax2TfLimitation.FOR_NON_NATIVE),
+        custom_numeric(dtypes=[np.complex128], devices=("cpu",),
+                       modes=("eager", "compiled", "graph"),
+                       tol=1e-13,
+                       native_serialization=Jax2TfLimitation.FOR_NATIVE | Jax2TfLimitation.FOR_NON_NATIVE),
         cls.helper_get_trig_custom_limitation(np.sinh)
     ]
 
@@ -348,6 +373,13 @@ class Jax2TfLimitation(test_harnesses.Limitation):
             devices=("cpu", "gpu"),
             modes=("eager", "graph", "compiled")),
         custom_numeric(
+            dtypes=[dtypes.bfloat16],
+            tol=5e-5,
+            # Error for GL
+            devices=("tpu",),
+            modes=("eager", "graph", "compiled"),
+            native_serialization=Jax2TfLimitation.FOR_NATIVE),
+        custom_numeric(
             custom_assert=custom_assert,
             description=(
                 "May return different values in the strictly upper triangular "
@@ -389,35 +421,34 @@ class Jax2TfLimitation(test_harnesses.Limitation):
   @classmethod
   def cumlogsumexp(cls, harness):
     return [
-        # JAX uses a different lowering for CPU and GPU.
         custom_numeric(
-            dtypes=(np.float16, jnp.bfloat16),
-            devices=("cpu", "gpu"),
+            dtypes=(np.float16, jnp.bfloat16, np.float32),
+            devices=("cpu", "gpu", "tpu"),
             modes=("eager", "graph", "compiled"),
-            tol=5e-1)
+            tol=5e-1,
+        )
     ]
-
 
   @classmethod
   def cumprod(cls, harness):
     return [
-        # JAX uses a different lowering for CPU and GPU.
         custom_numeric(
             dtypes=(np.float16, jnp.bfloat16),
-            devices=("cpu", "gpu"),
+            devices=("cpu", "gpu", "tpu"),
             modes=("eager", "graph", "compiled"),
-            tol=5e-1)
+            tol=5e-1,
+        )
     ]
 
   @classmethod
   def cumsum(cls, harness):
     return [
-        # JAX uses a different lowering for CPU and GPU.
         custom_numeric(
             dtypes=(np.float16, jnp.bfloat16),
-            devices=("cpu", "gpu"),
+            devices=("cpu", "gpu", "tpu"),
             modes=("eager", "graph", "compiled"),
-            tol=5e-1)
+            tol=5e-1,
+        )
     ]
 
   @classmethod
@@ -547,6 +578,12 @@ class Jax2TfLimitation(test_harnesses.Limitation):
         # may be more precise.
         custom_numeric(dtypes=[np.float16], devices=["cpu"], tol=1e-2,
                        modes=("eager", "graph", "compiled")),
+        # Flakiness on different_dtypes_lhs_int16_4_3_rhs_float16_3_6_dimensionnumbers_1_0_enable_xla_True
+        # Strangely, we only see the flakiness in primitives_graph_serialization_test_gpu_pjrt_c_api
+        custom_numeric(dtypes=[np.int16], devices=["gpu"], tol=1e-2,
+                       modes=("eager", "graph", "compiled"),
+                       enabled=(harness.params["enable_xla"] and
+                                harness.dtype != harness.params["rhs_dtype"])),
     ]
 
   @classmethod
@@ -747,7 +784,11 @@ class Jax2TfLimitation(test_harnesses.Limitation):
             enabled=(str(harness.params["fft_type"]) in ["FftType.IFFT",
                                                          "FftType.IRFFT"])),
         # TODO: very high tolerance
-        custom_numeric(tol=1e-3, modes=("eager", "graph", "compiled")),
+        custom_numeric(tol=1e-3, modes=("eager", "graph", "compiled"),
+                       native_serialization=Jax2TfLimitation.FOR_NON_NATIVE),
+        custom_numeric(tol=1e-5, modes=("eager", "graph", "compiled"),
+                       native_serialization=Jax2TfLimitation.FOR_NATIVE,
+                       devices=("cpu",)),
     ]
 
   @classmethod
@@ -1025,9 +1066,9 @@ class Jax2TfLimitation(test_harnesses.Limitation):
 
   @classmethod
   def qr(cls, harness: test_harnesses.Harness):
-    # See https://github.com/google/jax/pull/3775#issuecomment-659407824;
+    # See https://github.com/jax-ml/jax/pull/3775#issuecomment-659407824;
     #     # jit_compile=True breaks for complex types.
-    # TODO: see https://github.com/google/jax/pull/3775#issuecomment-659407824.
+    # TODO: see https://github.com/jax-ml/jax/pull/3775#issuecomment-659407824.
     # - for now, the performance of the HLO QR implementation called when
     #   compiling with TF is expected to have worse performance than the
     #   custom calls made in JAX.
@@ -1076,7 +1117,7 @@ class Jax2TfLimitation(test_harnesses.Limitation):
             tol=3e-5),
         Jax2TfLimitation(
             "Large deviations on TPU for enable_xla=False",
-            dtypes=[np.float16, np.float32],
+            dtypes=[dtypes.bfloat16, np.float16, np.float32],
             devices="tpu",
             modes=("eager", "graph", "compiled"),
             expect_tf_error=False,
@@ -1086,6 +1127,8 @@ class Jax2TfLimitation(test_harnesses.Limitation):
                      modes=("eager", "graph", "compiled",), tol=1e-5),
       custom_numeric(devices=("cpu", "gpu"), dtypes=[np.float16],
                      modes=("eager", "graph", "compiled",), tol=5e-3),
+      custom_numeric(devices=("cpu", "gpu"), dtypes=[dtypes.bfloat16],
+                     modes=("eager", "graph", "compiled",), tol=5e-1),
     ]
 
   @classmethod
@@ -1275,7 +1318,7 @@ class Jax2TfLimitation(test_harnesses.Limitation):
         # values like 1.0000001 on float32, which are clipped to 1.0. It is
         # possible that anything other than `cos_angular_diff` can be outside
         # the interval [0, 1] due to roundoff.
-        cos_angular_diff = jnp.clip(cos_angular_diff, a_min=0.0, a_max=1.0)
+        cos_angular_diff = jnp.clip(cos_angular_diff, min=0.0, max=1.0)
 
         angular_diff = jnp.arccos(cos_angular_diff)
 

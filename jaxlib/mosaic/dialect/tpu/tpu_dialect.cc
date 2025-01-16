@@ -19,6 +19,7 @@ limitations under the License.
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -29,8 +30,11 @@ limitations under the License.
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectImplementation.h"  // IWYU pragma: keep.
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "absl/hash/hash.h"
+#include "mlir/include/mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/include/mlir/Dialect/Func/IR/FuncOps.h"
 #include "jaxlib/mosaic/dialect/tpu/tpu_dialect.cc.inc"
 #include "jaxlib/mosaic/dialect/tpu/tpu_enums.cc.inc"
 #include "xla/layout.h"
@@ -64,6 +68,27 @@ void TPUDialect::initialize() {
 #define GET_OP_LIST
 #include "jaxlib/mosaic/dialect/tpu/tpu_ops.cc.inc"
       >();
+}
+
+/* static */ std::optional<CoreType> TPUDialect::GetCoreTypeAttr(
+    Operation *op) {
+  Attribute attr = op->getAttr(GetCoreTypeKey());
+  if (attr == nullptr) {
+    return std::nullopt;
+  }
+  if (!mlir::isa<CoreTypeAttr>(attr)) {
+    return std::nullopt;
+  }
+  return mlir::cast<CoreTypeAttr>(attr).getValue();
+}
+
+FailureOr<std::optional<CoreType>> GetCoreTypeOfParentFunc(Operation &op) {
+  mlir::Operation *func_op = op.getParentOfType<mlir::func::FuncOp>();
+  if (func_op == nullptr) {
+    return op.emitError() << "Operation " << op.getName()
+                          << " is not inside a func.func";
+  }
+  return TPUDialect::GetCoreTypeAttr(func_op);
 }
 
 void VectorLayoutAttr::print(AsmPrinter &printer) const {
@@ -102,7 +127,7 @@ Attribute TiledLayoutAttr::parse(AsmParser &parser, Type type) {
   if (failed(parser.parseLess())) {
     return {};
   }
-  llvm::SmallVector<xla::Tile, 2> tiles;
+  SmallVector<xla::Tile, 2> tiles;
   int64_t size;
   while (succeeded(parser.parseOptionalLParen())) {
     xla::Tile &tile = tiles.emplace_back();
@@ -120,7 +145,7 @@ Attribute TiledLayoutAttr::parse(AsmParser &parser, Type type) {
       tile.add_dimensions(size);
     }
   }
-  llvm::SmallVector<int64_t, 2> tile_strides;
+  SmallVector<int64_t, 2> tile_strides;
   int64_t stride;
   if (failed(parser.parseComma())) {
     return {};
@@ -181,6 +206,45 @@ MemRefType getMemRefType(Value value) {
     value = erase_op.getOperand();
   }
   return cast<MemRefType>(value.getType());
+}
+
+bool isGuaranteedDivisible(Value value, int64_t divisor, int64_t fuel) {
+  if (fuel <= 0) {
+    return false;
+  }
+  if (divisor == 1) {
+    return true;
+  }
+  if (auto assume_op = value.getDefiningOp<tpu::AssumeMultipleOp>()) {
+    return assume_op.getMultiple() % divisor == 0;
+  }
+  if (auto mul_op = value.getDefiningOp<arith::MulIOp>()) {
+    // We check RHS first, because MLIR canonicalizes constants to the right.
+    return isGuaranteedDivisible(mul_op.getRhs(), divisor, fuel / 2) ||
+           isGuaranteedDivisible(mul_op.getLhs(), divisor, (fuel + 1) / 2);
+  }
+  if (auto cst_op = value.getDefiningOp<arith::ConstantOp>()) {
+    auto int_attr = dyn_cast<IntegerAttr>(cst_op.getValue());
+    return int_attr && int_attr.getInt() % divisor == 0;
+  }
+  if (auto cast_op = value.getDefiningOp<arith::IndexCastOp>()) {
+    return isGuaranteedDivisible(cast_op.getOperand(), divisor, fuel - 1);
+  }
+  return false;
+}
+
+DotDimensionNumbersAttr defaultDimensionNumbers(Builder &builder,
+                                                bool transpose_lhs,
+                                                bool transpose_rhs) {
+  return tpu::DotDimensionNumbersAttr::get(
+      builder.getContext(),
+      /*lhs_contracting_dims=*/{transpose_lhs ? 0 : 1},
+      /*rhs_contracting_dims=*/{transpose_rhs ? 1 : 0},
+      /*lhs_non_contracting_dims=*/{transpose_lhs ? 1 : 0},
+      /*rhs_non_contracting_dims=*/{transpose_rhs ? 0 : 1},
+      /*output_dim_order=*/{0, transpose_lhs ? 1 : 0, 1, transpose_rhs ? 0 : 1},
+      /*lhs_batch_dims=*/{},
+      /*rhs_batch_dims=*/{});
 }
 
 }  // namespace mlir::tpu

@@ -14,8 +14,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import functools
-from typing import Any, Callable
+from typing import Any
 
 from jax._src import ad_util
 from jax._src import api_util
@@ -59,7 +60,7 @@ def transformation_with_aux(
   return fun.wrap(gen, gen_static_args, out_store), out_thunk
 
 flatten_fun_nokwargs = transformation_with_aux(
-    api_util.flatten_fun_nokwargs.args[0])  # type: ignore[has-type]
+    api_util.flatten_fun_nokwargs.args[0])
 
 
 ### api
@@ -71,7 +72,7 @@ class custom_transpose:
 
   def __init__(self, fun: Callable):
     functools.update_wrapper(self, fun)
-    self.fun = fun  # type: ignore[assignment]
+    self.fun = fun
 
   __getattr__ = custom_api_util.forward_attr
 
@@ -154,18 +155,9 @@ class CustomTransposePrimitive(core.Primitive):
   map_primitive = False
   multiple_results = True
 
-  def bind(self, call, *args, **params):
-    # TODO(frostig,mattjj): This doesn't handle closures yet, which is
-    # a bit involved. Closures are complicated by us binding `call`
-    # twice in the JVP rule for custom transpose. The `env_trace_todo`
-    # output by `process_env_traces` due to one of those two bindings
-    # should be passable to the other, and need to be passed onward
-    # since the second bind is deferred by partial eval (since it
-    # typically receives unknowns)
-    top_trace = core.find_top_trace(args)
-    tracers = map(top_trace.full_raise, args)
-    outs = top_trace.process_custom_transpose(self, call, tracers, **params)
-    return outs
+  def bind_with_trace(self, trace, call_args, params):
+    call, tracers = call_args[0], call_args[1:]
+    return trace.process_custom_transpose(self, call, tracers, **params)
 
   # TODO(frostig,mattjj): consider keeping `call` as a named parameter
   # instead of following this "call primitive" convention.

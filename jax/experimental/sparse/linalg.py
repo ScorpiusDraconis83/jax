@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Union, Callable
+from collections.abc import Callable
 import functools
 
 import jax
@@ -132,7 +132,7 @@ def _lobpcg_standard_callable(
   _check_inputs(A, X)
 
   if tol is None:
-    tol = jnp.finfo(dt).eps
+    tol = float(jnp.finfo(dt).eps)
 
   X = _orthonormalize(X)
   P = _extend_basis(X, X.shape[1])
@@ -602,7 +602,9 @@ def spsolve(data, indices, indptr, b, tol=1e-6, reorder=1):
   """A sparse direct solver using QR factorization.
 
   Accepts a sparse matrix in CSR format `data, indices, indptr` arrays.
-  Currently only the CUDA GPU backend is implemented.
+  Currently only the CUDA GPU backend is implemented, the CPU backend will fall
+  back to `scipy.sparse.linalg.spsolve`. Neither the CPU nor the GPU
+  implementation support batching with `vmap`.
 
   Args:
     data : An array containing the non-zero entries of the CSR matrix.

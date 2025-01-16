@@ -14,17 +14,18 @@ Experimental Modules
 .. toctree::
     :maxdepth: 1
 
-    jax.experimental.array_api
     jax.experimental.checkify
-    jax.experimental.host_callback
-    jax.experimental.maps
-    jax.experimental.pjit
-    jax.experimental.sparse
-    jax.experimental.jet
-    jax.experimental.custom_partitioning
-    jax.experimental.multihost_utils
     jax.experimental.compilation_cache
+    jax.experimental.custom_partitioning
+    jax.experimental.jet
     jax.experimental.key_reuse
+    jax.experimental.mesh_utils
+    jax.experimental.multihost_utils
+    jax.experimental.pallas
+    jax.experimental.pjit
+    jax.experimental.serialize_executable
+    jax.experimental.shard_map
+    jax.experimental.sparse
 
 Experimental APIs
 -----------------
@@ -34,7 +35,3 @@ Experimental APIs
 
    enable_x64
    disable_x64
-
-   jax.experimental.checkify.checkify
-   jax.experimental.checkify.check
-   jax.experimental.checkify.check_error

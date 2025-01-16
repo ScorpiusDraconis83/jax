@@ -14,12 +14,35 @@
 
 # ruff: noqa: F401
 from jax._src.xla_bridge import (
-  default_backend as default_backend,
-  get_backend as get_backend,
-  xla_client as xla_client,
-  _backends as _backends,
+  get_backend as _deprecated_get_backend,
 )
 
 from jax._src.compiler import (
   get_compile_options as get_compile_options,
 )
+
+_deprecations = {
+  # Added July 31, 2024
+  "get_backend": (
+    "jax.lib.xla_bridge.get_backend is deprecated; use jax.extend.backend.get_backend.",
+    _deprecated_get_backend
+  ),
+  # Finalized 2024-12-11; remove after 2025-3-11
+  "xla_client": (
+    "jax.lib.xla_bridge.xla_client was removed in JAX v0.4.38; use jax.lib.xla_client directly.",
+    None
+  ),
+  "default_backend": (
+    "jax.lib.xla_bridge.default_backend was removed in JAX v0.4.38; use jax.default_backend.",
+    None
+  ),
+}
+
+import typing as _typing
+if _typing.TYPE_CHECKING:
+  from jax._src.xla_bridge import get_backend as get_backend
+else:
+  from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
+  __getattr__ = _deprecation_getattr(__name__, _deprecations)
+  del _deprecation_getattr
+del _typing

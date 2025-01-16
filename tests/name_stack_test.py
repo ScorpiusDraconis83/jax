@@ -20,18 +20,15 @@ from jax._src import core
 from jax import lax
 from jax._src.pjit import pjit
 from jax._src import linear_util as lu
-from jax import config
 from jax._src import test_util as jtu
-from jax._src.lib import xla_client
+from jax._src import ad_checkpoint
 
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 def _get_hlo(f):
   def wrapped(*args, **kwargs):
-    c = jax.xla_computation(f)(*args, **kwargs)
-    print_opts = xla_client._xla.HloPrintOptions.short_parsable()
-    print_opts.print_metadata = True
-    return c.as_hlo_module().to_string(print_opts)
+    return jax.jit(f).lower(*args, **kwargs).as_text('hlo', debug_info=True)
+
   return wrapped
 
 
@@ -215,7 +212,7 @@ class NameStackTransformationTest(jtu.JaxTestCase):
     self.assertIn('transpose(jvp(foo))/mul', hlo_text)
 
   def test_grad_should_add_jvp_and_transpose_to_call_jaxpr(self):
-    @jax.grad
+    @jax.value_and_grad
     @jax.named_scope('foo')
     @jax.jit
     def f(x):
@@ -240,7 +237,7 @@ class NameStackTransformationTest(jtu.JaxTestCase):
 
   def test_nested_jit_stack(self):
 
-    @jax.grad
+    @jax.value_and_grad
     @jax.jit
     def f(x):
       @jax.jit
@@ -254,7 +251,7 @@ class NameStackTransformationTest(jtu.JaxTestCase):
     self.assertIn('transpose(jvp(jit(f)))/jit(g)/mul', hlo_text)
 
   def test_nested_pjit_stack(self):
-    @jax.grad
+    @jax.value_and_grad
     @pjit
     def f(x):
       @pjit
@@ -266,6 +263,18 @@ class NameStackTransformationTest(jtu.JaxTestCase):
     self.assertIn('jvp(pjit(f))/pjit(g)/sin', hlo_text)
     self.assertIn('jvp(pjit(f))/pjit(g)/cos', hlo_text)
     self.assertIn('transpose(jvp(pjit(f)))/pjit(g)/mul', hlo_text)
+
+  def test_remat_appears_in_hlo(self):
+    @ad_checkpoint.remat
+    def f(x):
+      return jnp.sin(x)
+
+    hlo_text = _get_hlo(f)(2.)
+    hlo_text_grad = _get_hlo(jax.grad(f))(2.)
+    self.assertNotIn('rematted_computation', hlo_text)
+    self.assertNotIn('remat', hlo_text)
+    self.assertIn('checkpoint', hlo_text)
+    self.assertIn('rematted_computation', hlo_text_grad)
 
 
 class NameStackControlFlowTest(jtu.JaxTestCase):
@@ -485,16 +494,19 @@ class NameStackControlFlowTest(jtu.JaxTestCase):
 
   def test_grad_of_cond_transforms_name_stack(self):
 
-    @jax.grad
+    @jax.value_and_grad
     @jax.named_scope('foo')
     def f(x, y):
       @jax.named_scope('true')
       def true_fn(x):
         return x * x * 2.
+
       @jax.named_scope('false')
       def false_fn(x):
         return x / jnp.square(x)
+
       return lax.cond(y, true_fn, false_fn, x)
+
     jaxpr = jax.make_jaxpr(f)(1., True)
     self.assertEqual(str(jaxpr.eqns[1].source_info.name_stack), 'jvp(foo)')
     self.assertEqual(str(jaxpr.eqns[2].source_info.name_stack),
@@ -517,7 +529,7 @@ class NameStackControlFlowTest(jtu.JaxTestCase):
   def test_vmap_of_grad_of_cond_transforms_name_stack(self):
 
     @functools.partial(jax.vmap, in_axes=(0, None))
-    @jax.grad
+    @jax.value_and_grad
     @jax.named_scope('foo')
     def f(x, y):
       @jax.named_scope('true')

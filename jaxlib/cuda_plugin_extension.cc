@@ -12,75 +12,54 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include <Python.h>
 
+#include <cstdint>
 #include <string>
-#include <string_view>
-#include <utility>
 
 #include "nanobind/nanobind.h"
-#include "jaxlib/kernel_nanobind_helpers.h"
-#include "xla/pjrt/c/pjrt_c_api.h"
-#include "xla/pjrt/c/pjrt_c_api_gpu_extension.h"
-#include "xla/pjrt/c/pjrt_c_api_helpers.h"
-#include "xla/python/py_client_gpu.h"
-#include "xla/python/status_casters.h"
-#include "xla/status.h"
-#include "xla/util.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "third_party/gpus/cuda/include/cuda.h"
+#include "jaxlib/gpu_plugin_extension.h"
+#include "xla/pjrt/status_casters.h"
 
 namespace nb = nanobind;
 
 namespace xla {
 namespace {
-Status RegisterCustomCallTarget(const PJRT_Api* c_api, nb::str fn_name,
-                                nb::capsule fn) {
-  static const char* const kName = "xla._CUSTOM_CALL_TARGET";
-  if (std::string_view(fn.name()) != kName) {
-    return InvalidArgument(
-        "Argument to RegisterCustomCallTargetRegistry was not a "
-        "xla._CUSTOM_CALL_TARGET capsule.");
+static std::string ToString(CUresult result) {
+  const char* error_name;
+  if (cuGetErrorName(result, &error_name)) {
+    return absl::StrCat("UNKNOWN ERROR (", static_cast<int>(result), ")");
   }
-
-  if (c_api->extension_start == nullptr) {
-    return Unimplemented("The plugin does not have extension.");
+  const char* error_string;
+  if (cuGetErrorString(result, &error_string)) {
+    return error_name;
   }
-  const PJRT_Structure_Base* next =
-      reinterpret_cast<const PJRT_Structure_Base*>(c_api->extension_start);
-  while (next != nullptr &&
-         next->type !=
-             PJRT_Structure_Type::PJRT_Structure_Type_Gpu_Custom_Call) {
-    next = next->next;
-  }
-  if (next == nullptr) {
-    return Unimplemented("The plugin does not have a custom call extension.");
-  }
-
-  PJRT_Gpu_Register_Custom_Call_Args args;
-  args.struct_size = PJRT_Gpu_Register_Custom_Call_Args_STRUCT_SIZE;
-  args.function_name = fn_name.c_str();
-  args.function_name_size = nb::len(fn_name);
-  args.custom_call_function = static_cast<void*>(fn.data());
-  RETURN_STATUS_IF_PJRT_ERROR(
-      reinterpret_cast<const PJRT_Gpu_Custom_Call*>(next)->custom_call(&args),
-      c_api);
-  return OkStatus();
-}
-
-nb::dict Registrations() {
-  nb::dict dict;
-  dict["xla_python_gpu_callback"] =
-      jax::EncapsulateFunction(xla::XlaPythonGpuCallback);
-  return dict;
+  return absl::StrCat(error_name, ": ", error_string);
 }
 }  // namespace
 
 NB_MODULE(cuda_plugin_extension, m) {
-  m.def("register_custom_call_target", [](nb::capsule c_api, nb::str fn_name,
-                                          nb::capsule fn,
-                                          nb::str xla_platform_name) {
-    xla::ThrowIfError(RegisterCustomCallTarget(
-        static_cast<const PJRT_Api*>(c_api.data()), fn_name, std::move(fn)));
-  });
-  m.def("registrations", &Registrations);
+  BuildGpuPluginExtension(m);
+  m.def(
+      "get_device_ordinal",
+      [](std::intptr_t data_value) {
+        if (data_value == 0) {
+          return 0;
+        }
+        int device_ordinal;
+        void* data_ptr = reinterpret_cast<void*>(data_value);
+        CUresult result =
+            cuPointerGetAttribute(static_cast<void*>(&device_ordinal),
+                                  CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                                  reinterpret_cast<CUdeviceptr>(data_ptr));
+        if (result != CUDA_SUCCESS) {
+          xla::ThrowIfError(absl::InvalidArgumentError(absl::StrCat(
+              "Not able to get the device_ordinal: ", ToString(result))));
+        }
+        return device_ordinal;
+      },
+      nb::arg("data_value"));
 }
 }  // namespace xla

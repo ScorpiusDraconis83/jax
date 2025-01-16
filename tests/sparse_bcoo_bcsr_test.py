@@ -22,7 +22,6 @@ import unittest
 
 from absl.testing import absltest
 import jax
-from jax import config
 from jax import jit
 from jax import lax
 from jax import vmap
@@ -40,7 +39,7 @@ import jax.random
 from jax.util import split_list
 import numpy as np
 
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 COMPATIBLE_SHAPE_PAIRS = [
     [(), ()],
@@ -143,7 +142,7 @@ all_dtypes = jtu.dtypes.integer + jtu.dtypes.floating + jtu.dtypes.complex
 
 def _is_required_cuda_version_satisfied(cuda_version):
   version = xla_bridge.get_backend().platform_version
-  if version == "<unknown>" or version.split()[0] == "rocm":
+  if version == "<unknown>" or "rocm" in version.split():
     return False
   else:
     return int(version.split()[-1]) >= cuda_version
@@ -151,7 +150,7 @@ def _is_required_cuda_version_satisfied(cuda_version):
 class BCOOTest(sptu.SparseTestCase):
 
   def gpu_matmul_warning_context(self, msg):
-    if sptu.GPU_LOWERING_ENABLED and config.jax_bcoo_cusparse_lowering:
+    if jax.config.jax_bcoo_cusparse_lowering:
       return self.assertWarnsRegex(sparse.CuSparseEfficiencyWarning, msg)
     return contextlib.nullcontext()
 
@@ -311,7 +310,7 @@ class BCOOTest(sptu.SparseTestCase):
     self.assertArraysEqual(data2, jnp.array([[1, 0], [5, 0], [9, 0]]))
 
   def test_bcoo_extract_batching(self):
-    # https://github.com/google/jax/issues/9431
+    # https://github.com/jax-ml/jax/issues/9431
     indices = jnp.zeros((4, 1, 1), dtype=int)
     mat = jnp.arange(4.).reshape((4, 1))
 
@@ -354,7 +353,7 @@ class BCOOTest(sptu.SparseTestCase):
     self.assertEqual(hess.shape, data.shape + 2 * M.shape)
 
   def test_bcoo_extract_zero_nse(self):
-    # Regression test for https://github.com/google/jax/issues/13653
+    # Regression test for https://github.com/jax-ml/jax/issues/13653
 
     # (n_batch, n_sparse, n_dense) = (1, 0, 0), nse = 2
     args_maker = lambda: (jnp.zeros((3, 2, 0), dtype='int32'), jnp.arange(3))
@@ -479,9 +478,6 @@ class BCOOTest(sptu.SparseTestCase):
       dtype=jtu.dtypes.floating + jtu.dtypes.complex,
   )
   @jax.default_matmul_precision("float32")
-  @unittest.skipIf(
-      not sptu.GPU_LOWERING_ENABLED, "test requires cusparse/hipsparse"
-  )
   @jtu.run_on_devices("gpu")
   def test_bcoo_dot_general_cusparse(
       self, lhs_shape, rhs_shape, dtype, lhs_contracting, rhs_contracting
@@ -528,9 +524,6 @@ class BCOOTest(sptu.SparseTestCase):
       dtype=jtu.dtypes.floating + jtu.dtypes.complex,
   )
   @jax.default_matmul_precision("float32")
-  @unittest.skipIf(
-      not sptu.GPU_LOWERING_ENABLED, "test requires cusparse/hipsparse"
-  )
   @jtu.run_on_devices("gpu")
   def test_bcoo_batched_matmat_cusparse(
       self,
@@ -581,9 +574,6 @@ class BCOOTest(sptu.SparseTestCase):
       ],
       dtype=jtu.dtypes.floating + jtu.dtypes.complex,
   )
-  @unittest.skipIf(
-      not sptu.GPU_LOWERING_ENABLED, "test requires cusparse/hipsparse"
-  )
   @jtu.run_on_devices("gpu")
   def test_bcoo_batched_matmat_default_lowering(
       self,
@@ -615,9 +605,6 @@ class BCOOTest(sptu.SparseTestCase):
     matmat_default_lowering_fallback = sp_matmat(lhs_bcoo, rhs)
     self.assertArraysEqual(matmat_expected, matmat_default_lowering_fallback)
 
-  @unittest.skipIf(
-      not sptu.GPU_LOWERING_ENABLED, "test requires cusparse/hipsparse"
-  )
   @jtu.run_on_devices("gpu")
   def test_bcoo_dot_general_oob_and_unsorted_indices_cusparse(self):
     """Tests bcoo dot general with out-of-bound and unsorted indices."""
@@ -986,8 +973,9 @@ class BCOOTest(sptu.SparseTestCase):
     self.assertArraysAllClose(out.todense(), expected_out)
     self.assertEqual(out.nse, expected_nse)
 
+  @jtu.ignore_warning(message="bcoo_dot_general cusparse/hipsparse lowering not available")
   def test_bcoo_spdot_general_ad_bug(self):
-    # Regression test for https://github.com/google/jax/issues/10163
+    # Regression test for https://github.com/jax-ml/jax/issues/10163
     A_indices = jnp.array([[0, 1], [0, 2], [1, 1], [1, 2], [1, 0]])
     A_values = jnp.array([-2.0, 1.0, -1.0, 0.5, 2.0])
     A_shape = (2, 3)
@@ -1300,7 +1288,7 @@ class BCOOTest(sptu.SparseTestCase):
     self.assertEqual(y2.nse, x.nse)
 
   def test_bcoo_sum_duplicates_padding(self):
-    # Regression test for https://github.com/google/jax/issues/8163
+    # Regression test for https://github.com/jax-ml/jax/issues/8163
     size = 3
     data = jnp.array([1, 0, 0])
     indices = jnp.array([1, size, size])[:, None]
@@ -1619,7 +1607,7 @@ class BCOOTest(sptu.SparseTestCase):
       self._CheckAgainstDense(operator.mul, operator.mul, args_maker, tol=tol)
 
   def test_bcoo_mul_sparse_with_duplicates(self):
-    # Regression test for https://github.com/google/jax/issues/8888
+    # Regression test for https://github.com/jax-ml/jax/issues/8888
     indices = jnp.array([[0, 1, 0, 0, 1, 1],
                          [1, 0, 1, 2, 0, 2]]).T
     data = jnp.array([1, 2, 3, 4, 5, 6])
@@ -1952,6 +1940,18 @@ class BCSRTest(sptu.SparseTestCase):
     if jnp.issubdtype(dtype, jnp.floating):
       self._CheckGradsSparse(dense_func, sparse_func, args_maker)
 
+  def test_bcoo_spdot_abstract_eval_bug(self):
+    # Regression test for https://github.com/jax-ml/jax/issues/21921
+    lhs = sparse.BCOO(
+      (jnp.float32([[1]]), lax.broadcasted_iota(jnp.int32, (10, 1, 1), 0)),
+      shape=(10, 10))
+    rhs = sparse.BCOO(
+        (jnp.float32([1]), jnp.int32([[3]])),
+        shape=(10,))
+    args_maker = lambda: [lhs, rhs]
+    def func(lhs, rhs):
+      return (lhs @ rhs).todense()
+    self._CompileAndCheck(func, args_maker)
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

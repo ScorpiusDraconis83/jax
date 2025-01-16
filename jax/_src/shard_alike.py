@@ -15,6 +15,7 @@
 from functools import partial
 import itertools
 
+from jax._src import config
 from jax._src import core
 from jax._src.interpreters import ad
 from jax._src.interpreters import mlir
@@ -23,8 +24,7 @@ from jax._src.tree_util import tree_flatten, tree_unflatten
 from jax._src.interpreters import batching
 from jax._src.util import safe_zip
 from jax._src.lib import xla_client as xc
-from jax._src.api_util import shaped_abstractify
-from jax._src.lib.mlir import ir
+from jax._src.lib.mlir import dialects, ir
 
 _next_shard_group_id = itertools.count()
 
@@ -38,13 +38,13 @@ def shard_alike(x, y):
                      f'Got x_tree: {x_tree}, y_tree: {y_tree}')
 
   for x_, y_ in safe_zip(x_flat, y_flat):
-    x_aval = shaped_abstractify(x_)
-    y_aval = shaped_abstractify(y_)
+    x_aval = core.shaped_abstractify(x_)
+    y_aval = core.shaped_abstractify(y_)
     if x_aval.shape != y_aval.shape:
       raise ValueError(
           'The leaves shapes of `x` and `y` should match. Got `x` leaf shape:'
           f' {x_aval.shape} and `y` leaf shape: {y_aval.shape}. File an issue at'
-          ' https://github.com/google/jax/issues if you want this feature.')
+          ' https://github.com/jax-ml/jax/issues if you want this feature.')
 
   outs = [shard_alike_p.bind(x_, y_) for x_, y_ in safe_zip(x_flat, y_flat)]
   x_out_flat, y_out_flat = zip(*outs)
@@ -64,9 +64,21 @@ def shard_alike_transpose(ct, **kwargs):
     return shard_alike(x_ct, y_ct)
 ad.deflinear(shard_alike_p, shard_alike_transpose)
 
-def _shard_alike_batcher(vals_in, dims_in):
-  vals_out = shard_alike_p.bind(*vals_in)
-  return vals_out, dims_in
+
+def _shard_alike_batcher(batched_args, batch_dims):
+  x, y = batched_args
+  xd, yd = batch_dims
+  if xd == yd:
+    return shard_alike(x, y), (xd, yd)
+  elif xd is batching.not_mapped:
+    x = batching.broadcast(x, y.shape[yd], yd)
+    return shard_alike(x, y), (yd, yd)
+  elif yd is batching.not_mapped:
+    y = batching.broadcast(y, x.shape[xd], xd)
+    return shard_alike(x, y), (xd, xd)
+  else:
+    y = batching.moveaxis(y, yd, xd)
+    return shard_alike(x, y), (xd, xd)
 batching.primitive_batchers[shard_alike_p] = _shard_alike_batcher
 
 
@@ -78,6 +90,11 @@ def _group_shard(
     y_aval_out: core.AbstractValue,
 ) -> tuple[ir.Value, ir.Value]:
   shard_group_id = next(_next_shard_group_id)
+
+  if config.use_shardy_partitioner.value:
+    dialects.sdy.ShardingGroupOp(x, shard_group_id)
+    dialects.sdy.ShardingGroupOp(y, shard_group_id)
+    return x, y
 
   unknown_op_sharding = xc.OpSharding()
   unknown_op_sharding.type = xc.OpSharding.Type.UNKNOWN

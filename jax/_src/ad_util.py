@@ -13,13 +13,14 @@
 # limitations under the License.
 from __future__ import annotations
 
+from collections.abc import Callable
 import types
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 from jax._src import core
 from jax._src import traceback_util
-from jax._src.core import Primitive, valid_jaxtype, raise_to_shaped, get_aval
-from jax._src.tree_util import register_pytree_node
+from jax._src.core import Primitive, valid_jaxtype, get_aval
+from jax._src.tree_util import register_pytree_node, tree_map
 from jax._src.typing import Array, ArrayLike
 from jax._src.util import safe_map
 
@@ -30,7 +31,6 @@ T = TypeVar('T')
 map = safe_map
 
 def add_jaxvals(x: ArrayLike, y: ArrayLike) -> Array:
-  dtype = core.get_aval(x).dtype
   return add_jaxvals_p.bind(x, y)
 
 add_jaxvals_p = Primitive('add_any')
@@ -43,14 +43,15 @@ raw_jaxval_adders = {}  # type: ignore
 
 @add_jaxvals_p.def_abstract_eval
 def add_abstract(x, y):
-  return core.lattice_join(x, y)
+  assert core.typematch(x, y)
+  return x
 
 def zeros_like_aval(aval: core.AbstractValue) -> Array:
   return aval_zeros_likers[type(aval)](aval)
 aval_zeros_likers: dict[type, Callable[[Any], Array]] = {}
 
 def zeros_like_jaxval(val):
-  return zeros_like_aval(core.raise_to_shaped(core.get_aval(val)))
+  return zeros_like_aval(core.get_aval(val))
 
 def instantiate(z: Zero | Array) -> Array:
   if isinstance(z, Zero):
@@ -65,8 +66,8 @@ class Zero:
   def __repr__(self) -> str:
     return f'Zero({self.aval})'
   @staticmethod
-  def from_value(val: Any) -> Zero:
-    return Zero(raise_to_shaped(get_aval(val)))
+  def from_primal_value(val: Any) -> Zero:
+    return Zero(get_aval(val).to_tangent_aval())
 
 register_pytree_node(Zero, lambda z: ((), z.aval), lambda aval, _: Zero(aval))
 
@@ -82,6 +83,7 @@ stop_gradient_p.def_impl(_stop_gradient_impl)
 stop_gradient_p.def_abstract_eval(lambda x: x)
 
 
+# User-facing version of `Zero`
 class SymbolicZero:
   def __init__(self, aval: core.AbstractValue) -> None:
     self.aval = aval
@@ -107,6 +109,19 @@ class SymbolicZero:
         return types.MethodType(attr.fun, self)
       else:
         return attr
+
+  @staticmethod
+  def from_primal_value(val: Any) -> SymbolicZero:
+    return SymbolicZero(get_aval(val).to_tangent_aval())
+
+def zero_from_primal(val, symbolic_zeros=False):
+  def f(x):
+    tangent_aval = get_aval(x).to_tangent_aval()
+    if symbolic_zeros:
+      return SymbolicZero(tangent_aval)
+    else:
+      return zeros_like_aval(tangent_aval)
+  return tree_map(f, val)
 
 JaxTypeOrTracer = Any
 

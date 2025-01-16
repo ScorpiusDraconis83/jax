@@ -14,6 +14,8 @@
 
 load(
     "//jaxlib:jax.bzl",
+    "if_windows",
+    "nanobind_extension",
     "py_extension",
     "windows_cc_shared_mlir_library",
 )
@@ -32,11 +34,11 @@ COPTS = [
 ]
 
 LINKOPTS = select({
-    "@tsl//tsl:macos": [
+    "@xla//xla/tsl:macos": [
         "-Wl,-rpath,@loader_path/",
         "-Wl,-rename_section,__TEXT,text_env,__TEXT,__text",
     ],
-    "@tsl//tsl:windows": [],
+    "@xla//xla/tsl:windows": [],
     "//conditions:default": [
         "-Wl,-rpath,$$ORIGIN/",
     ],
@@ -52,7 +54,71 @@ py_extension(
     deps = [
         ":jaxlib_mlir_capi_shared_library",
         "@llvm-project//mlir:MLIRBindingsPythonCoreNoCAPI",
-        "@llvm-project//mlir:MLIRBindingsPythonHeaders",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeaders",
+        "@nanobind",
+    ],
+)
+
+py_extension(
+    name = "_mlirDialectsGPU",
+    srcs = [
+        "@llvm-project//mlir:lib/Bindings/Python/DialectGPU.cpp",
+    ],
+    copts = COPTS,
+    linkopts = LINKOPTS,
+    deps = [
+        ":jaxlib_mlir_capi_shared_library",
+        "@llvm-project//mlir:CAPIGPUHeaders",
+        "@llvm-project//mlir:CAPIIRHeaders",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeaders",
+        "@nanobind",
+    ],
+)
+
+py_extension(
+    name = "_mlirGPUPasses",
+    srcs = [
+        "@llvm-project//mlir:lib/Bindings/Python/GPUPasses.cpp",
+    ],
+    copts = COPTS,
+    linkopts = LINKOPTS,
+    deps = [
+        ":jaxlib_mlir_capi_shared_library",
+        "@llvm-project//mlir:CAPIGPUHeaders",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeaders",
+        "@nanobind",
+    ],
+)
+
+py_extension(
+    name = "_mlirDialectsNVGPU",
+    srcs = [
+        "@llvm-project//mlir:lib/Bindings/Python/DialectNVGPU.cpp",
+    ],
+    copts = COPTS,
+    linkopts = LINKOPTS,
+    deps = [
+        ":jaxlib_mlir_capi_shared_library",
+        "@llvm-project//mlir:CAPIIRHeaders",
+        "@llvm-project//mlir:CAPINVGPUHeaders",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeaders",
+        "@nanobind",
+    ],
+)
+
+py_extension(
+    name = "_mlirDialectsLLVM",
+    srcs = [
+        "@llvm-project//mlir:lib/Bindings/Python/DialectLLVM.cpp",
+    ],
+    copts = COPTS,
+    linkopts = LINKOPTS,
+    deps = [
+        ":jaxlib_mlir_capi_shared_library",
+        "@llvm-project//mlir:CAPIIRHeaders",
+        "@llvm-project//mlir:CAPILLVMHeaders",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeaders",
+        "@nanobind",
     ],
 )
 
@@ -66,8 +132,8 @@ py_extension(
     deps = [
         ":jaxlib_mlir_capi_shared_library",
         "@llvm-project//mlir:CAPISparseTensorHeaders",
-        "@llvm-project//mlir:MLIRBindingsPythonHeaders",
-        "@pybind11",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeaders",
+        "@nanobind",
     ],
 )
 
@@ -81,7 +147,22 @@ py_extension(
     deps = [
         ":jaxlib_mlir_capi_shared_library",
         "@llvm-project//mlir:CAPISparseTensorHeaders",
-        "@pybind11",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeaders",
+        "@nanobind",
+    ],
+)
+
+py_extension(
+    name = "_mosaic_gpu_ext",
+    srcs = ["mosaic_gpu_ext.cc"],
+    copts = COPTS,
+    linkopts = LINKOPTS,
+    deps = [
+        ":jaxlib_mlir_capi_shared_library",
+        "//jaxlib/mosaic/dialect/gpu:gpu_dialect_capi_headers",
+        "@llvm-project//mlir:CAPIIRHeaders",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeadersAndDeps",
+        "@nanobind",
     ],
 )
 
@@ -101,19 +182,36 @@ py_extension(
         "@com_google_absl//absl/log:check",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:CAPIIRHeaders",
-        "@llvm-project//mlir:MLIRBindingsPythonHeadersAndDeps",
-        "@pybind11",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeadersAndDeps",
+        "@nanobind",
+        "@xla//xla/python:nb_numpy",
+        "@xla//xla/tsl/python/lib/core:numpy",
     ],
 )
 
 # This target contains the extension and it's Python dependencies, which are not
-# supported by the `py_extension`/`pybind_extension` macros.
+# supported by the `py_extension`/`nanobind_extension` macros.
 py_library(
     name = "_tpu_ext_lib",
     deps = [
         ":_tpu_ext",
         "//jaxlib/mlir:ir",
         "//jaxlib/mosaic/python:layout_defs",
+    ],
+)
+
+nanobind_extension(
+    name = "_triton_ext",
+    srcs = ["triton_ext.cc"],
+    copts = COPTS,
+    linkopts = LINKOPTS,
+    pytype_srcs = ["_triton_ext.pyi"],
+    deps = [
+        ":jaxlib_mlir_capi_shared_library",
+        "//jaxlib/triton:triton_dialect_capi_headers",
+        "@llvm-project//mlir:CAPIIRHeaders",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeadersAndDeps",
+        "@nanobind",
     ],
 )
 
@@ -131,6 +229,31 @@ symlink_inputs(
     ],
 )
 
+cc_library(
+    name = "jaxlib_mlir_capi_shims",
+    srcs = ["jaxlib_mlir_capi_shims.cc"],
+    hdrs = ["jaxlib_mlir_capi_shims.h"],
+    deps = [
+        "@llvm-project//mlir:BuiltinToLLVMIRTranslation",
+        "@llvm-project//mlir:CAPIIRHeaders",
+        "@llvm-project//mlir:GPUPipelines",
+        "@llvm-project//mlir:GPUToLLVMIRTranslation",
+        "@llvm-project//mlir:LLVMToLLVMIRTranslation",
+        "@llvm-project//mlir:MemRefTransforms",
+        "@llvm-project//mlir:NVVMTarget",
+        "@llvm-project//mlir:NVVMToLLVMIRTranslation",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
+    name = "jaxlib_mlir_capi_shims_hdrs",
+    hdrs = ["jaxlib_mlir_capi_shims.h"],
+    deps = [
+        "@llvm-project//mlir:CAPIIRHeaders",
+    ],
+)
+
 # JAX-specific registrations.
 py_extension(
     name = "register_jax_dialects",
@@ -140,15 +263,20 @@ py_extension(
     deps = [
         ":jaxlib_mlir_capi_shared_library",
         "@llvm-project//mlir:CAPIArithHeaders",
+        "@llvm-project//mlir:CAPIGPUHeaders",
         "@llvm-project//mlir:CAPIIRHeaders",
+        "@llvm-project//mlir:CAPILLVMHeaders",
         "@llvm-project//mlir:CAPIMathHeaders",
         "@llvm-project//mlir:CAPIMemRefHeaders",
+        "@llvm-project//mlir:CAPINVGPUHeaders",
+        "@llvm-project//mlir:CAPINVVMHeaders",
         "@llvm-project//mlir:CAPISCFHeaders",
         "@llvm-project//mlir:CAPITransformsHeaders",
         "@llvm-project//mlir:CAPIVectorHeaders",
-        "@llvm-project//mlir:MLIRBindingsPythonHeaders",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeaders",
         "@local_config_python//:headers",
-        "@pybind11",
+        "@nanobind",
+        "@shardy//shardy/integrations/c:sdy_capi_headers",
     ],
 )
 
@@ -166,10 +294,32 @@ py_extension(
     deps = [
         ":jaxlib_mlir_capi_shared_library",
         "@llvm-project//mlir:CAPIIRHeaders",
-        "@llvm-project//mlir:MLIRBindingsPythonHeaders",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeaders",
         "@local_config_python//:headers",
-        "@pybind11",
+        "@nanobind",
         "@xla//xla/mlir_hlo:CAPIHeaders",
+    ],
+)
+
+##---------------------------------------------------------------------------##
+# Shardy Extensions
+##---------------------------------------------------------------------------##
+
+py_extension(
+    name = "_sdy",
+    srcs = [
+        "@shardy//shardy/integrations/python/ir:sdy_module.cc",
+    ],
+    copts = COPTS,
+    linkopts = LINKOPTS,
+    deps = [
+        ":jaxlib_mlir_capi_shared_library",
+        "@llvm-project//mlir:CAPIIRHeaders",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeaders",
+        "@local_config_python//:headers",
+        "@nanobind",
+        "@shardy//shardy/integrations/c:sdy_capi_headers",
     ],
 )
 
@@ -180,16 +330,16 @@ py_extension(
 py_extension(
     name = "_chlo",
     srcs = [
-        "@stablehlo//:stablehlo/integrations/python/ChloModule.cpp",
+        "@stablehlo//:chlo_py_api_files",
     ],
     copts = COPTS,
     linkopts = LINKOPTS,
     deps = [
         ":jaxlib_mlir_capi_shared_library",
         "@llvm-project//mlir:CAPIIRHeaders",
-        "@llvm-project//mlir:MLIRBindingsPythonHeaders",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeaders",
         "@local_config_python//:headers",
-        "@pybind11",
+        "@nanobind",
         "@stablehlo//:chlo_capi_headers",
     ],
 )
@@ -197,21 +347,18 @@ py_extension(
 py_extension(
     name = "_stablehlo",
     srcs = [
-        "@stablehlo//:stablehlo/integrations/python/PortableApi.cpp",
-        "@stablehlo//:stablehlo/integrations/python/PortableApi.h",
-        "@stablehlo//:stablehlo/integrations/python/StablehloModule.cpp",
+        "@stablehlo//:stablehlo_py_api_files",
     ],
     copts = COPTS,
     linkopts = LINKOPTS,
     deps = [
         ":jaxlib_mlir_capi_shared_library",
+        "@llvm-project//llvm:Support",
         "@llvm-project//mlir:CAPIIRHeaders",
-        "@llvm-project//mlir:MLIRBindingsPythonHeaders",
+        "@llvm-project//mlir:MLIRBindingsPythonNanobindHeaders",
         "@local_config_python//:headers",
-        "@pybind11",
+        "@nanobind",
         "@stablehlo//:stablehlo_capi_headers",
-        "@stablehlo//:stablehlo_portable_api",
-        "@stablehlo//:stablehlo_serialization",
     ],
 )
 
@@ -220,12 +367,12 @@ py_extension(
 cc_library(
     name = "jaxlib_mlir_capi_shared_library",
     srcs = select({
-        "@tsl//tsl:windows": [":jaxlib_mlir_capi.dll"],
-        "@tsl//tsl:macos": [":libjaxlib_mlir_capi.dylib"],
+        "@xla//xla/tsl:windows": [":jaxlib_mlir_capi.dll"],
+        "@xla//xla/tsl:macos": [":libjaxlib_mlir_capi.dylib"],
         "//conditions:default": [":libjaxlib_mlir_capi.so"],
     }),
     deps = select({
-        "@tsl//tsl:windows": [":jaxlib_mlir_capi_dll"],
+        "@xla//xla/tsl:windows": [":jaxlib_mlir_capi_dll"],
         "//conditions:default": [],
     }),
 )
@@ -234,19 +381,30 @@ cc_library(
     name = "jaxlib_mlir_capi_objects",
     deps = [
         "//jaxlib/mosaic:tpu_dialect_capi_objects",
+        "//jaxlib/mosaic/dialect/gpu:gpu_dialect_capi_objects",
         "@llvm-project//mlir:CAPIArithObjects",
+        "@llvm-project//mlir:CAPIGPUObjects",
         "@llvm-project//mlir:CAPIIRObjects",
+        "@llvm-project//mlir:CAPILLVMObjects",
         "@llvm-project//mlir:CAPIMathObjects",
         "@llvm-project//mlir:CAPIMemRefObjects",
+        "@llvm-project//mlir:CAPINVGPUObjects",
+        "@llvm-project//mlir:CAPINVVMObjects",
         "@llvm-project//mlir:CAPISCFObjects",
         "@llvm-project//mlir:CAPISparseTensorObjects",
         "@llvm-project//mlir:CAPITransformsObjects",
         "@llvm-project//mlir:CAPIVectorObjects",
         "@llvm-project//mlir:MLIRBindingsPythonCAPIObjects",
+        "@shardy//shardy/integrations/c:sdy_capi_objects",
         "@stablehlo//:chlo_capi_objects",
         "@stablehlo//:stablehlo_capi_objects",
         "@xla//xla/mlir_hlo:CAPIObjects",
-    ],
+    ] + if_windows(
+        [],
+        [
+            "//jaxlib/triton:triton_dialect_capi_objects",
+        ],
+    ),
 )
 
 cc_binary(
@@ -275,6 +433,7 @@ windows_cc_shared_mlir_library(
     exported_symbol_prefixes = [
         "mlir",
         "chlo",
+        "sdy",
         "stablehlo",
     ],
     deps = [":jaxlib_mlir_capi_objects"],

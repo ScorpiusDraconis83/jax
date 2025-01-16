@@ -16,12 +16,12 @@
 from __future__ import annotations
 
 import builtins
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import dataclasses
 from functools import partial, wraps
 import math
 import string
-from typing import Any, Callable, Optional
+from typing import Any
 
 from jax._src import core
 from jax import lax
@@ -32,7 +32,7 @@ from jax._src import util
 from jax.experimental.jax2tf import jax2tf
 
 import numpy as np
-import tensorflow as tf  # type: ignore[import]
+import tensorflow as tf
 
 
 # Implementation rules for primitives when XLA is not linked in. These
@@ -364,6 +364,7 @@ tf_impl_no_xla[lax.conv_general_dilated_p] = _conv_general_dilated
 def _dot_general(lhs, rhs, *, dimension_numbers,
                  precision: tuple[PrecisionType, PrecisionType] | None,
                  preferred_element_type: DType | None,
+                 out_type=None,
                  _in_avals: Sequence[core.ShapedArray],
                  _out_aval: core.ShapedArray):
   """Implementation of lax.dot_general_p in terms of tf.linalg.einsum."""
@@ -547,7 +548,12 @@ def _validate_reduce_window_inputs(operand_shape, computation_name, dtype,
     # tf.math.reduce_min.
     raise _reduce_error(f"Min pool does not support operands of type {dtype}")
   if computation_name == "add" and dtype not in [
-      tf.float16, tf.float32, tf.float64
+      tf.bfloat16,
+      tf.float16,
+      tf.float32,
+      tf.float64,
+      tf.int16,
+      tf.int32,
   ]:
     raise _reduce_error("Add pooling does not support operands of type "
                         f"{dtype}")
@@ -586,7 +592,7 @@ def _padding_reduce_window(operand, operand_shape, computation_name,
   padding_type = pads_to_padtype(operand_shape, window_dimensions,
                                  window_strides, padding)
 
-  # https://github.com/google/jax/issues/11874.
+  # https://github.com/jax-ml/jax/issues/11874.
   needs_manual_padding = (
       padding_type == "SAME" and computation_name == "add" and
       window_dimensions != [1] * len(operand_shape))
@@ -653,6 +659,13 @@ def _reduce_monoid(operand, window_dimensions, window_strides, padding,
       raise NotImplementedError(
           f"TODO: use tf.nn.pool with dynamic shapes¨{window_dimensions=} "
           f" {window_strides=} {dilations=}")
+    # tf.nn.pool() currently does not suport tf.int32 and so we cast back and
+    # forth in order to be able to convert.
+    if (inputs.dtype in [tf.int16, tf.int32]) and computation_name == "add":
+      original_dtype = inputs.dtype
+      inputs = tf.cast(inputs, dtype=tf.float32)
+    else:
+      original_dtype = None
     result = tf.nn.pool(
         inputs,
         window_shape=window_dimensions,
@@ -660,6 +673,8 @@ def _reduce_monoid(operand, window_dimensions, window_strides, padding,
         padding=padding_type,
         strides=window_strides,
         dilations=dilations)
+    if original_dtype:
+      result = tf.cast(result, dtype=original_dtype)
 
     if has_only_spatial_dims:
       # If the input only had spatial dimensions we need to contract the batch

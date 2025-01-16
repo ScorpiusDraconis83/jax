@@ -15,12 +15,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import functools
 import operator
-from typing import Any, Callable, Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
-import jax.numpy as jnp
 from jax import lax
 from jax.api_util import flatten_fun_nokwargs
 from jax._src.interpreters import ad
@@ -45,7 +44,8 @@ from jax._src.typing import Array
 from jax._src.util import (partition_list, merge_lists, safe_map, safe_zip,
                            split_list, split_dict, weakref_lru_cache)
 from jax._src.lax.control_flow import loops
-from jax._src.lax.control_flow.common import _abstractify, _initial_style_jaxpr
+from jax._src.lax.control_flow.common import _initial_style_jaxpr
+import numpy as np
 
 ## JAX utilities
 
@@ -70,35 +70,12 @@ for_p.multiple_results = True
 
 ### Tracing utilities
 
-def _hoist_consts_to_refs(jaxpr: core.Jaxpr) -> core.Jaxpr:
-  all_const_avals = [var.aval for var in jaxpr.constvars]
-  is_const_ref = [isinstance(var.aval, AbstractRef) for var in
-                  jaxpr.constvars]
-  const_avals, const_ref_avals = partition_list(is_const_ref, all_const_avals)
-  const_avals = map(AbstractRef, const_avals)
-  merged_const_avals = merge_lists(is_const_ref, const_avals, const_ref_avals)
-  i_aval, *arg_avals = (var.aval for var in jaxpr.invars)
-  in_avals = [i_aval, *merged_const_avals, *arg_avals]
-  num_consts = len(merged_const_avals)
-
-  def _hoist(i, *consts_args):
-    all_consts, args = split_list(consts_args, [num_consts])
-    consts, const_refs = partition_list(is_const_ref, all_consts)
-    # We immediately read the const values out of the `Ref`s.
-    consts = map(lambda x: ref_get(x, ()), consts)
-    all_consts = merge_lists(is_const_ref, consts, const_refs)
-    return core.eval_jaxpr(jaxpr, all_consts, i, *args)
-  hoisted_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
-      lu.wrap_init(_hoist), in_avals)
-  assert not consts, "All consts should have been converted to refs"
-  return hoisted_jaxpr
-
 def _trace_to_jaxpr_with_refs(f, state_tree: PyTreeDef,
                               state_avals: Sequence[core.AbstractValue]
                               ) -> tuple[core.Jaxpr, list[Any], PyTreeDef]:
   f, out_tree_thunk = flatten_fun_nokwargs(
       lu.wrap_init(f), treedef_tuple((tree_structure(0), state_tree)))
-  jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
+  jaxpr, _, consts, () = pe.trace_to_jaxpr_dynamic(
       f, state_avals)
   return jaxpr, consts, out_tree_thunk()
 
@@ -155,13 +132,12 @@ def for_loop(nsteps: int | Sequence[int],
   nsteps, = nsteps
   flat_state, state_tree = tree_flatten(init_state)
   state_avals = map(state_utils.val_to_ref_aval, flat_state)
-  idx_aval = core.ShapedArray((), jnp.dtype("int32"))
+  idx_aval = core.ShapedArray((), dtypes.canonicalize_dtype(np.int64))
   jaxpr, consts, out_tree = _trace_to_jaxpr_with_refs(
       body, state_tree, [idx_aval, *state_avals])
   if out_tree != tree_structure(None):
     raise Exception("`body` should not return anything.")
-  # Remove constvars from jaxpr and turn them into `Ref`s
-  jaxpr = _hoist_consts_to_refs(jaxpr)
+  jaxpr = state_utils.hoist_consts_to_refs(jaxpr, index=1)
   which_linear = (False,) * (len(consts) + len(flat_state))
   out_flat = for_p.bind(*consts, *flat_state, jaxpr=jaxpr, nsteps=int(nsteps),
                         reverse=reverse, which_linear=which_linear,
@@ -177,7 +153,7 @@ Y = TypeVar('Y')
 
 def scan(f: Callable[[Carry, X], tuple[Carry, Y]],
          init: Carry,
-         xs: X,
+         xs: X | None = None,
          length: int | None = None,
          reverse: bool = False,
          unroll: int = 1) -> tuple[Carry, Y]:
@@ -220,13 +196,13 @@ def scan(f: Callable[[Carry, X], tuple[Carry, Y]],
     init_flat = tree_leaves(init)
     _, in_tree = tree_flatten((init, xs))
 
-    carry_avals = tuple(map(_abstractify, init_flat))
+    carry_avals = tuple(map(core.get_aval, init_flat))
     jaxpr, _, out_tree = _initial_style_jaxpr(
         f, in_tree, carry_avals + x_avals, "scan")
     return jaxpr, out_tree
   jaxpr, out_tree = _create_jaxpr(init)
   _, ys_avals = tree_unflatten(out_tree, jaxpr.out_avals)
-  ys = tree_map(lambda aval: jnp.zeros([length, *aval.shape], aval.dtype),
+  ys = tree_map(lambda aval: lax.full([length, *aval.shape], 0, aval.dtype),
                 ys_avals)
   def for_body(i, refs):
     carry_refs, xs_refs, ys_refs = refs
@@ -275,7 +251,7 @@ def _for_impl(*args, jaxpr, nsteps, reverse, which_linear, unroll):
 
 def _for_impl_unrolled(body, nsteps, unroll, *args):
   remainder = nsteps % unroll
-  i = jnp.int32(0)
+  i = lax.full((), 0, dtypes.canonicalize_dtype(np.int64))
   state = list(args)
 
   for _ in range(remainder):
@@ -302,34 +278,30 @@ def _cached_for_jaxpr(jaxpr):
   discharged_jaxpr, body_consts = discharge_state(jaxpr, ())
   return core.ClosedJaxpr(discharged_jaxpr, body_consts)
 
-def _for_vmap(spmd_axis_name, axis_size, axis_name, main_type, args, dims, *,
+def _for_vmap(axis_data, args, dims, *,
               jaxpr, nsteps, reverse, which_linear, unroll):
   init_batched = [d is not batching.not_mapped for d in dims]
   closed_jaxpr = _cached_for_jaxpr(jaxpr)
   batched = init_batched
   for _ in range(len(batched)):
     _, out_batched = batching.batch_jaxpr(
-        closed_jaxpr,
-        axis_size, [False] + batched, instantiate=batched,
-        axis_name=axis_name, spmd_axis_name=spmd_axis_name, main_type=main_type)
+        closed_jaxpr, axis_data, [False] + batched, instantiate=batched)
     if out_batched == batched:
       break
     batched = map(operator.or_, batched, out_batched)
   else:
     raise Exception("Invalid fixpoint")
-  args = [batching.broadcast(x, axis_size, 0) if now_bat and not was_bat
+  args = [batching.broadcast(x, axis_data.size, 0) if now_bat and not was_bat
           else batching.moveaxis(x, d, 0) if now_bat else x
           for x, d, was_bat, now_bat in zip(args, dims, init_batched, batched)]
   batched_jaxpr_, _ = batching.batch_jaxpr(
-      pe.close_jaxpr(jaxpr), axis_size, [False] + batched, [],
-      axis_name=axis_name, spmd_axis_name=spmd_axis_name, main_type=main_type)
+      pe.close_jaxpr(jaxpr), axis_data, [False] + batched, [])
   batched_jaxpr, () = batched_jaxpr_.jaxpr, batched_jaxpr_.consts  # TODO consts
   out_flat = for_p.bind(*args, jaxpr=batched_jaxpr, nsteps=nsteps,
                         reverse=reverse, which_linear=which_linear,
                         unroll=unroll)
   return out_flat, [0 if b else batching.not_mapped for b in batched]
-batching.axis_primitive_batchers[for_p] = functools.partial(_for_vmap, None)
-batching.spmd_axis_primitive_batchers[for_p] = _for_vmap
+batching.fancy_primitive_batchers[for_p] = _for_vmap
 
 def _for_jvp(primals, tangents, *, jaxpr, nsteps, reverse, which_linear,
              unroll):
@@ -364,7 +336,7 @@ def _for_jvp(primals, tangents, *, jaxpr, nsteps, reverse, which_linear,
   # into outputs as well. We don't care about these in AD so we throw them out.
   out_primals, out_tangents = split_list(out_flat, [len(primals)])
   out_tangents_iter = iter(out_tangents)
-  out_tangents = [next(out_tangents_iter) if nz else ad_util.Zero.from_value(p)
+  out_tangents = [next(out_tangents_iter) if nz else ad_util.Zero.from_primal_value(p)
                   for p, nz in zip(out_primals, nonzero_tangents)]
   return out_primals, out_tangents
 ad.primitive_jvps[for_p] = _for_jvp
@@ -441,7 +413,7 @@ def _for_partial_eval(trace: pe.JaxprTrace, *tracers: pe.JaxprTracer,
   else:
     raise Exception("Invalid fixpoint")
   del out_unknowns  # redundant since it's the same as `in_unknowns`
-  tracers = tuple(trace.instantiate_const(t) if uk else t  # type: ignore
+  tracers = tuple(trace.instantiate_const(t) if uk else t
                   for t, uk in zip(tracers, in_unknowns))
 
   # We use `partial_eval_jaxpr_custom` here because it won't remove effectful
@@ -607,7 +579,7 @@ def _for_partial_eval_custom(saveable, in_unknowns, in_inst, eqn):
     return for_p.bind(*jaxpr_known_args, jaxpr=jaxpr_known, nsteps=nsteps,
                       reverse=reverse, which_linear=jaxpr_known_which_linear,
                       unroll=unroll)
-  call_jaxpr_, _, call_jaxpr_consts = pe.trace_to_jaxpr_dynamic(
+  call_jaxpr_, _, call_jaxpr_consts, () = pe.trace_to_jaxpr_dynamic(
       known, [v.aval for v in known_invars])
   call_jaxpr = core.ClosedJaxpr(call_jaxpr_, call_jaxpr_consts)
   eqn_known = pe.new_jaxpr_eqn(known_invars, [*known_outvars, *resvars],
@@ -629,7 +601,7 @@ def _for_partial_eval_custom(saveable, in_unknowns, in_inst, eqn):
     _, ans = split_list(out_flat, [num_res])
     _, ans = partition_list(out_inst, ans)
     return ans
-  call_jaxpr_, _, call_jaxpr_consts = pe.trace_to_jaxpr_dynamic(
+  call_jaxpr_, _, call_jaxpr_consts, () = pe.trace_to_jaxpr_dynamic(
       staged, [v.aval for v in [*resvars, *eqn.invars]])
   assert len(jaxpr_staged.invars) - 1 == len(call_jaxpr_.invars)
   call_jaxpr = core.ClosedJaxpr(call_jaxpr_, call_jaxpr_consts)
@@ -667,7 +639,7 @@ def _convert_outputs_to_writes(
       AbstractRef(core.ShapedArray((nsteps, *v.aval.shape),  # pytype: disable=attribute-error
                   v.aval.dtype))  # pytype: disable=attribute-error
       for v, loop_invar in zip(jaxpr.outvars, loop_invar_res)]
-  jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
+  jaxpr, _, consts, () = pe.trace_to_jaxpr_dynamic(
       eval_jaxpr, [*in_avals, *res_ref_avals])
   assert not consts
   return jaxpr, [core.ShapedArray(a.shape, a.dtype) for a in res_ref_avals]  # pytype: disable=attribute-error
@@ -693,7 +665,7 @@ def _convert_inputs_to_reads(
                   aval.dtype))  # pytype: disable=attribute-error
       for aval, loop_invar in zip(res_val_avals, loop_invar_res)]
 
-  jaxpr, _, () = pe.trace_to_jaxpr_dynamic(
+  jaxpr, _, (), () = pe.trace_to_jaxpr_dynamic(
       eval_jaxpr, [i_aval, *res_ref_avals, *orig_ref_avals])
   return jaxpr
 
@@ -717,10 +689,9 @@ def transpose_jaxpr(jaxpr: core.Jaxpr, which_linear: list[bool]) -> core.Jaxpr:
     if used_i:
       primals_args = [*primals_args, i]
     ct_args = [x for x, u in zip(args, used_ct) if u]
-    ad.backward_pass(
-        tangent_jaxpr, (), False, (), (*primals_args, *ct_args), ())
+    ad.backward_pass(tangent_jaxpr, False, (), (*primals_args, *ct_args), ())
     return []
-  jaxpr_trans, _, _ = pe.trace_to_jaxpr_dynamic(
+  jaxpr_trans, _, _, () = pe.trace_to_jaxpr_dynamic(
       lu.wrap_init(trans), [v.aval for v in jaxpr.invars])
   return jaxpr_trans
 
@@ -773,7 +744,7 @@ def discharged_for_loop(nsteps, body, init_state, *, reverse: bool = False):
   """
   flat_state, state_tree = tree_flatten(init_state)
   state_avals = map(state_utils.val_to_ref_aval, flat_state)
-  idx_aval = core.ShapedArray((), jnp.dtype("int32"))
+  idx_aval = core.ShapedArray((), dtypes.canonicalize_dtype(np.int64))
   jaxpr, consts, out_tree = _trace_to_jaxpr_with_refs(
       body, state_tree, [idx_aval, *state_avals])
   if out_tree != tree_structure(None):
@@ -781,7 +752,7 @@ def discharged_for_loop(nsteps, body, init_state, *, reverse: bool = False):
   discharged_jaxpr, discharged_consts = discharge_state(jaxpr, consts)
 
   def fori_body(i, carry):
-    i = jnp.int32(i)
+    i = lax.convert_element_type(i, dtypes.canonicalize_dtype(np.int64))
     if reverse:
       i = nsteps - i - 1
     out_flat = core.eval_jaxpr(discharged_jaxpr, discharged_consts,

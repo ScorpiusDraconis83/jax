@@ -17,15 +17,13 @@ import importlib
 import logging
 import os
 import pathlib
-import platform
-import sys
 
 from jax._src.lib import xla_client
 import jax._src.xla_bridge as xb
 
 # cuda_plugin_extension locates inside jaxlib. `jaxlib` is for testing without
 # preinstalled jax cuda plugin packages.
-for pkg_name in ['jax_cuda12_plugin', 'jax_cuda11_plugin', 'jaxlib']:
+for pkg_name in ['jax_cuda12_plugin', 'jaxlib']:
   try:
     cuda_plugin_extension = importlib.import_module(
         f'{pkg_name}.cuda_plugin_extension'
@@ -48,6 +46,13 @@ def _get_library_path():
   local_path = os.path.join(
       os.path.dirname(__file__), 'pjrt_c_api_gpu_plugin.so'
   )
+  if not os.path.exists(local_path):
+    runfiles_dir = os.getenv('RUNFILES_DIR', None)
+    if runfiles_dir:
+      local_path = os.path.join(
+          runfiles_dir, 'xla/xla/pjrt/c/pjrt_c_api_gpu_plugin.so'
+      )
+
   if os.path.exists(local_path):
     logger.debug(
         'Native library %s does not exist. This most likely indicates an issue'
@@ -75,25 +80,7 @@ def initialize():
   if path is None:
     return
 
-  # TODO(b/300099402): use the util method when it is ready.
-  options = {}
-  visible_devices = xb.CUDA_VISIBLE_DEVICES.value
-  if visible_devices != 'all':
-    options['visible_devices'] = [int(x) for x in visible_devices.split(',')]
-
-  allocator = os.getenv('XLA_PYTHON_CLIENT_ALLOCATOR', 'default').lower()
-  memory_fraction = os.getenv('XLA_PYTHON_CLIENT_MEM_FRACTION', '')
-  preallocate = os.getenv('XLA_PYTHON_CLIENT_PREALLOCATE', '').lower()
-  if allocator not in ('default', 'platform', 'bfc', 'cuda_async'):
-    raise ValueError(
-        'XLA_PYTHON_CLIENT_ALLOCATOR env var must be "default", "platform", '
-        '"bfc", or "cuda_async", got "%s"' % allocator
-    )
-  options['allocator'] = allocator
-  if memory_fraction:
-    options['memory_fraction'] = float(memory_fraction)
-  if preallocate:
-    options['preallocate'] = preallocate not in ('false', '0')
+  options = xla_client.generate_pjrt_gpu_plugin_options()
   c_api = xb.register_plugin(
       'cuda', priority=500, library_path=str(path), options=options
   )
@@ -106,5 +93,11 @@ def initialize():
     )
     for _name, _value in cuda_plugin_extension.registrations().items():
       xla_client.register_custom_call_target(_name, _value, platform="CUDA")
+    xla_client.register_custom_type_id_handler(
+        "CUDA",
+        functools.partial(
+            cuda_plugin_extension.register_custom_type_id, c_api
+        ),
+    )
   else:
     logger.warning('cuda_plugin_extension is not found.')

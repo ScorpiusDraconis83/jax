@@ -19,8 +19,6 @@ import unittest
 from absl.testing import absltest
 import jax
 from jax import lax
-from jax import config
-from jax.experimental import maps
 from jax.experimental import pjit
 from jax.interpreters import pxla
 from jax._src import ad_checkpoint
@@ -35,23 +33,14 @@ try:
 except ModuleNotFoundError:
   rich = None
 
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
+jtu.request_cpu_devices(2)
 
 debug_print = debugging.debug_print
 
 def _format_multiline(text):
   return textwrap.dedent(text).lstrip()
 
-prev_xla_flags = None
-
-def setUpModule():
-  global prev_xla_flags
-  # This will control the CPU devices. On TPU we always have 2 devices
-  prev_xla_flags = jtu.set_host_platform_device_count(2)
-
-# Reset to previous configuration in case other test modules will be run.
-def tearDownModule():
-  prev_xla_flags()
 
 class DummyDevice:
   def __init__(self, platform, id):
@@ -70,6 +59,7 @@ class DebugCallbackTest(jtu.JaxTestCase):
       jax.debug.callback("this is not debug.print!")
 
 
+@jtu.thread_unsafe_test_class()  # printing isn't thread-safe
 class DebugPrintTest(jtu.JaxTestCase):
 
   def tearDown(self):
@@ -83,6 +73,18 @@ class DebugPrintTest(jtu.JaxTestCase):
       f(2)
       jax.effects_barrier()
     self.assertEqual(output(), "x: 2\n")
+
+  def test_static_args(self):
+    @jax.jit
+    def f(arr):
+      jax.debug.print("arr {array}, dtype: {dtype}, arr {array2}",
+                      array=arr, dtype=arr.dtype, array2=arr)
+    arr = jnp.array([1, 2, 3], dtype=jnp.float32)
+    with jtu.capture_stdout() as output:
+      f(arr)
+      jax.effects_barrier()
+    self.assertEqual(
+        output(), "arr [1. 2. 3.], dtype: float32, arr [1. 2. 3.]\n")
 
   def test_debug_print_works_with_named_format_strings(self):
     def f(x):
@@ -109,6 +111,16 @@ class DebugPrintTest(jtu.JaxTestCase):
       f(2)
       jax.effects_barrier()
     self.assertEqual(output(), "x: 2\n")
+
+  def test_can_stage_out_debug_print_with_formatting(self):
+    @jax.jit
+    def f(x):
+      debug_print('x: {x:.2f}', x=x)
+
+    with jtu.capture_stdout() as output:
+      f(2)
+      jax.effects_barrier()
+    self.assertEqual(output(), "x: 2.00\n")
 
   @jtu.device_supports_buffer_donation()
   def test_can_stage_out_debug_print_with_donate_argnums(self):
@@ -171,7 +183,7 @@ class DebugPrintTest(jtu.JaxTestCase):
     with jtu.capture_stdout() as output:
       f(np.array(2, np.int32))
       jax.effects_barrier()
-    self.assertEqual(output(), f"x: {str(dict(foo=np.array(2, np.int32)))}\n")
+    self.assertEqual(output(), f"x: {str(dict(foo=jnp.array(2, np.int32)))}\n")
 
   def test_debug_print_should_use_default_layout(self):
     data = np.array(
@@ -201,7 +213,31 @@ class DebugPrintTest(jtu.JaxTestCase):
          [ 1  2  3  4  5  6  7  8  9 10 12 13 14]]
     """))
 
+  def test_debug_print_respects_numpy_printoptions(self):
+    def f(x):
+      with np.printoptions(precision=2, suppress=True):
+        jax.debug.print("{}", x)
+    x = np.array([1.2345, 2.3456, 1E-7])
 
+    # Default numpy print options:
+    with jtu.capture_stdout() as output:
+      jax.debug.print("{}", x)
+    self.assertEqual(output(), "[1.2345e+00 2.3456e+00 1.0000e-07]\n")
+
+    # Modified print options without JIT:
+    with jtu.capture_stdout() as output:
+      f(x)
+      jax.effects_barrier()
+    self.assertEqual(output(), "[1.23 2.35 0.  ]\n")
+
+    # Modified print options with JIT:
+    with jtu.capture_stdout() as output:
+      jax.jit(f)(x)
+      jax.effects_barrier()
+    self.assertEqual(output(), "[1.23 2.35 0.  ]\n")
+
+
+@jtu.thread_unsafe_test_class()  # printing isn't thread-safe
 class DebugPrintTransformationTest(jtu.JaxTestCase):
 
   def test_debug_print_batching(self):
@@ -473,6 +509,7 @@ class DebugPrintTransformationTest(jtu.JaxTestCase):
       jax.effects_barrier()
     self.assertEqual(output(), "hello bwd: 2.0 3.0\n")
 
+@jtu.thread_unsafe_test_class()  # printing isn't thread-safe
 class DebugPrintControlFlowTest(jtu.JaxTestCase):
 
   def _assertLinesEqual(self, text1, text2):
@@ -688,6 +725,7 @@ class DebugPrintControlFlowTest(jtu.JaxTestCase):
       b3: 2
       """))
 
+@jtu.thread_unsafe_test_class()  # printing isn't thread-safe
 class DebugPrintParallelTest(jtu.JaxTestCase):
 
   def _assertLinesEqual(self, text1, text2):
@@ -789,39 +827,6 @@ class DebugPrintParallelTest(jtu.JaxTestCase):
           "[ 3  4  5  6  7  8  9 10]\n"
           "[ 4  5  6  7  8  9 10 11]\n")
 
-  def test_unordered_print_of_pjit_of_xmap(self):
-    def f(x):
-      def foo(x):
-        idx = lax.axis_index('foo')
-        debug_print("{idx}: {x}", idx=idx, x=x)
-        return jnp.mean(x, axis=['foo'])
-      out = maps.xmap(foo, in_axes=['foo'], out_axes=[...])(x)
-      debug_print("Out: {}", out)
-      return out
-    mesh = jax.sharding.Mesh(np.array(jax.devices()), ['dev'])
-    in_spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('dev'))
-    out_spec = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-    f = pjit.pjit(f, in_shardings=in_spec, out_shardings=out_spec)
-    with mesh:
-      with jtu.capture_stdout() as output:
-        f(jnp.arange(8, dtype=jnp.int32) * 2)
-        lines = ["0: 0", "1: 2", "2: 4", "3: 6", "4: 8", "5: 10", "6: 12",
-                 "7: 14", "Out: 7.0", ""]
-        jax.effects_barrier()
-        self._assertLinesEqual(output(), "\n".join(lines))
-
-  def test_unordered_print_with_xmap(self):
-    def f(x):
-      debug_print("{}", x, ordered=False)
-    f = maps.xmap(f, in_axes=['a'], out_axes=None, backend='cpu',
-                  axis_resources={'a': 'dev'})
-    with jax.sharding.Mesh(np.array(jax.devices()), ['dev']):
-      with jtu.capture_stdout() as output:
-        f(np.arange(40))
-        jax.effects_barrier()
-      lines = [f"{i}\n" for i in range(40)]
-      self._assertLinesEqual(output(), "".join(lines))
-
   def test_unordered_print_works_in_pmap_of_while(self):
     if jax.device_count() < 2:
       raise unittest.SkipTest("Test requires >= 2 devices.")
@@ -894,6 +899,7 @@ class DebugPrintParallelTest(jtu.JaxTestCase):
       f(jnp.arange(2))
       jax.effects_barrier()
 
+@jtu.thread_unsafe_test_class()  # logging isn't thread-safe
 class VisualizeShardingTest(jtu.JaxTestCase):
 
   def _create_devices(self, shape):
@@ -1125,9 +1131,9 @@ class InspectShardingTest(jtu.JaxTestCase):
     f(np.arange(8, dtype=jnp.float32))
     self.assertTrue(is_called)
 
-  def test_inspect_sharding_3d_input_pos_sharding(self):
+  def test_inspect_sharding_3d_jit(self):
     def _cb(sd):
-      self.assertIsInstance(sd, jax.sharding.PositionalSharding)
+      self.assertIsInstance(sd, jax.sharding.NamedSharding)
       self.assertLen(sd.device_set, 2)
 
     def f_(x):
@@ -1135,13 +1141,13 @@ class InspectShardingTest(jtu.JaxTestCase):
       return jnp.square(x)
 
     f = jax.jit(f_)
-    mesh = jtu.create_global_mesh((2,), ('x'))
+    mesh = jtu.create_mesh((2,), ('x'))
     s = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('x'))
     arr = jax.device_put(np.arange(8).reshape(2, 2, 2), s)
 
     f(arr)
 
-  def test_inspect_sharding_3d_input_named_sharding(self):
+  def test_inspect_sharding_3d_pjit(self):
     def _cb(sd):
       self.assertIsInstance(sd, jax.sharding.NamedSharding)
       self.assertLen(sd.device_set, 2)
@@ -1151,7 +1157,7 @@ class InspectShardingTest(jtu.JaxTestCase):
       return jnp.square(x)
 
     f = pjit.pjit(f_)
-    mesh = jtu.create_global_mesh((2,), ('x'))
+    mesh = jtu.create_mesh((2,), ('x'))
     s = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('x'))
     arr = jax.device_put(np.arange(8).reshape(2, 2, 2), s)
 

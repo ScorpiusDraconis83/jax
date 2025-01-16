@@ -20,6 +20,7 @@ import dataclasses
 import functools
 import itertools
 import os.path
+import re
 import sys
 import sysconfig
 import threading
@@ -54,15 +55,32 @@ _exclude_paths: list[str] = [
     os.path.dirname(sysconfig.__file__)
 ]
 
+@functools.cache
+def _exclude_path_regex() -> re.Pattern[str]:
+  # The regex below would not handle an empty set of exclusions correctly.
+  assert len(_exclude_paths) > 0
+  return re.compile('|'.join(f'^{re.escape(path)}' for path in _exclude_paths))
+
+
 def register_exclusion(path: str):
   _exclude_paths.append(path)
+  _exclude_path_regex.cache_clear()
+  is_user_filename.cache_clear()
 
 
 # Explicit inclusions take priority over exclude paths.
 _include_paths: list[str] = []
 
+@functools.cache
+def _include_path_regex() -> re.Pattern[str]:
+  patterns = [f'^{re.escape(path)}' for path in _include_paths]
+  patterns.append('_test.py$')
+  return re.compile('|'.join(patterns))
+
 def register_inclusion(path: str):
   _include_paths.append(path)
+  _include_path_regex.cache_clear()
+  is_user_filename.cache_clear()
 
 
 class Scope(NamedTuple):
@@ -124,9 +142,16 @@ def new_name_stack(name: str = '') -> NameStack:
   return name_stack
 
 
-class SourceInfo(NamedTuple):
+class SourceInfo:
   traceback: Traceback | None
   name_stack: NameStack
+
+  # It's slightly faster to use a class with __slots__ than a NamedTuple.
+  __slots__ = ['traceback', 'name_stack']
+
+  def __init__(self, traceback: Traceback | None, name_stack: NameStack):
+    self.traceback = traceback
+    self.name_stack = name_stack
 
   def replace(self, *, traceback: Traceback | None = None,
       name_stack: NameStack | None = None) -> SourceInfo:
@@ -138,11 +163,11 @@ class SourceInfo(NamedTuple):
 def new_source_info() -> SourceInfo:
   return SourceInfo(None, NameStack())
 
+@functools.cache
 def is_user_filename(filename: str) -> bool:
   """Heuristic that guesses the identity of the user's code in a stack trace."""
-  return (filename.endswith("_test.py") or
-          not any(filename.startswith(p) for p in _exclude_paths) or
-          any(filename.startswith(p) for p in _include_paths))
+  return (_include_path_regex().search(filename) is not None
+          or _exclude_path_regex().search(filename) is None)
 
 if sys.version_info >= (3, 11):
   def raw_frame_to_frame(code: types.CodeType, lasti: int) -> Frame:
@@ -170,7 +195,7 @@ def user_frames(source_info: SourceInfo) -> Iterator[Frame]:
   # frames, to allow testing this mechanism from tests.
   traceback = source_info.traceback
   code, lasti = traceback.raw_frames() if traceback else ([], [])
-  return (raw_frame_to_frame(code[i], lasti[i]) for i in range(len(code))  # type: ignore
+  return (raw_frame_to_frame(code[i], lasti[i]) for i in range(len(code))
           if is_user_filename(code[i].co_filename))
 
 @functools.lru_cache(maxsize=64)
