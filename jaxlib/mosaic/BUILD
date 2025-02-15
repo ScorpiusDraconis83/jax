@@ -1,3 +1,6 @@
+load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
+load("@rules_python//python:defs.bzl", "py_library")
+
 # Copyright 2023 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,24 +14,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-load("@rules_python//python:defs.bzl", "py_library")
-load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
+load("//jaxlib:jax.bzl", "pallas_extension_deps")
 
 licenses(["notice"])
 
 package(
     default_applicable_licenses = [],
     default_visibility = [
-        "//:__subpackages__",
+        "//jax:mosaic_users",
     ],
 )
 
 py_library(
     name = "mosaic",
     deps = [
+        "//jaxlib/mosaic/python:gpu_dialect",
         "//jaxlib/mosaic/python:tpu_dialect",
-        "//jaxlib/mosaic/python:tpu_passes",
     ],
 )
 
@@ -38,26 +39,45 @@ py_library(
 cc_library(
     name = "tpu_dialect",
     srcs = [
+        "dialect/tpu/array_util.cc",
         "dialect/tpu/layout.cc",
         "dialect/tpu/tpu_dialect.cc",
         "dialect/tpu/tpu_ops.cc",
-        "dialect/tpu/util.h",
+        "dialect/tpu/util.cc",
+        "dialect/tpu/vreg_util.cc",
+        ":extension_srcs",
     ] + glob([
         "dialect/tpu/transforms/*.cc",
     ]),
     hdrs = [
+        "dialect/tpu/array_util.h",
         "dialect/tpu/layout.h",
         "dialect/tpu/tpu_dialect.h",
+        "dialect/tpu/util.h",
+        "dialect/tpu/vreg_util.h",
     ] + glob([
         "dialect/tpu/transforms/*.h",
     ]),
     # compatible with libtpu
     deps = [
         ":tpu_inc_gen",
+        "//jaxlib:pass_boilerplate",
+        "//jaxlib/mosaic:serde",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/hash",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:ArithDialect",
         "@llvm-project//mlir:ControlFlowDialect",
+        "@llvm-project//mlir:DataLayoutInterfaces",
         "@llvm-project//mlir:Dialect",
+        "@llvm-project//mlir:DialectUtils",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:LinalgTransforms",
@@ -66,18 +86,15 @@ cc_library(
         "@llvm-project//mlir:Pass",
         "@llvm-project//mlir:SCFDialect",
         "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:TensorDialect",
         "@llvm-project//mlir:TransformUtils",
         "@llvm-project//mlir:VectorDialect",
         "@llvm-project//mlir:VectorTransforms",
+        "@tsl//tsl/platform:statusor",
         "@xla//xla:array",
         "@xla//xla:shape_util",
         "@xla//xla:util",
-        "@com_google_absl//absl/hash",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/log:check",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/types:span",
-    ],
+    ] + pallas_extension_deps,
 )
 
 gentbl_cc_library(
@@ -186,14 +203,14 @@ cc_library(
     deps = [
         ":tpu_dialect",
         ":tpu_inc_gen",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:CAPIIR",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Support",
         "@xla//xla:array",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/log:check",
     ],
 )
 
@@ -219,4 +236,50 @@ cc_library(
         "@llvm-project//mlir:IR",
     ],
     alwayslink = True,
+)
+
+cc_test(
+    name = "vreg_util_test",
+    srcs = ["dialect/tpu/vreg_util_test.cc"],
+    deps = [
+        ":tpu_dialect",
+        "//testing/base/public:gunit_main",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:VectorDialect",
+    ],
+)
+
+cc_test(
+    name = "array_util_test",
+    srcs = ["dialect/tpu/array_util_test.cc"],
+    deps = [
+        ":tpu_dialect",
+        "//testing/base/public:gunit_main",
+        "@llvm-project//mlir:Support",
+        "@xla//xla:array",
+    ],
+)
+
+filegroup(
+    name = "extension_srcs",
+    srcs = [
+        "dialect/tpu/transforms/extensions/apply_vector_layout_extensions.cc",
+        "dialect/tpu/transforms/extensions/infer_vector_layout_extensions.cc",
+    ],
+)
+
+cc_library(
+    name = "serde",
+    srcs = ["serde.cc"],
+    hdrs = ["serde.h"],
+    # compatible with libtpu
+    deps = [
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:DataLayoutInterfaces",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Support",
+    ],
 )

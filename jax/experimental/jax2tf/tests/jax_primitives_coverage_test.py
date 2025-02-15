@@ -28,10 +28,8 @@ import unittest
 
 from absl.testing import absltest
 
-import jax
 from jax._src import config
 from jax._src import test_util as jtu
-from jax._src import maps  # Needed for config flags.
 
 import numpy as np
 
@@ -42,7 +40,7 @@ from jax._src.internal_test_util import test_harnesses
 
 
 @jtu.with_config(jax_legacy_prng_key='allow',
-                 jax_enable_key_reuse_checks=False)
+                 jax_debug_key_reuse=False)
 class JaxPrimitiveTest(jtu.JaxTestCase):
 
   # This test runs for all primitive harnesses. For each primitive "xxx" the

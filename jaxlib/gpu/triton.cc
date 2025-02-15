@@ -29,7 +29,7 @@ namespace jax::JAX_GPU_NAMESPACE {
 NB_MODULE(_triton, m) {
   nb::class_<Kernel>(m, "TritonKernel")
       .def(nb::init<std::string, uint32_t, uint32_t, std::string, std::string,
-                    int>());
+                    int, uint32_t, uint32_t, uint32_t>());
 
   nb::class_<KernelCall::Parameter>(m, "TritonParameter");
 
@@ -131,6 +131,18 @@ NB_MODULE(_triton, m) {
               &minor, GPU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
           return major * 10 + minor;
         }));
+
+  m.def(
+      "get_arch_details",
+      ValueOrThrowWrapper([](int device) -> absl::StatusOr<absl::string_view> {
+#ifdef JAX_GPU_HIP
+        hipDeviceProp_t prop;
+        hipGetDeviceProperties(&prop, 0);
+        return prop.gcnArchName;
+#else
+        return absl::UnimplementedError("Not a HIP GPU");
+#endif
+      }));
 
   m.def("get_serialized_metadata",
         ValueOrThrowWrapper(

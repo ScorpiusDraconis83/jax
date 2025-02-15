@@ -20,14 +20,15 @@ from absl.testing import absltest
 from absl.testing import parameterized
 
 import numpy as np
+import scipy
 import scipy.special as osp_special
 
 import jax
+import jax.numpy as jnp
 from jax._src import test_util as jtu
 from jax.scipy import special as lsp_special
 
-from jax import config
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 
 all_shapes = [(), (4,), (3, 4), (3, 1), (1, 4), (2, 1, 4)]
@@ -53,10 +54,10 @@ int_dtypes = jtu.dtypes.integer
 
 JAX_SPECIAL_FUNCTION_RECORDS = [
     op_record(
-        "beta", 2, float_dtypes, jtu.rand_positive, False
+        "beta", 2, float_dtypes, jtu.rand_default, False
     ),
     op_record(
-        "betaln", 2, float_dtypes, jtu.rand_positive, False
+        "betaln", 2, float_dtypes, jtu.rand_default, False
     ),
     op_record(
         "betainc", 3, float_dtypes, jtu.rand_positive, False
@@ -72,6 +73,9 @@ JAX_SPECIAL_FUNCTION_RECORDS = [
     ),
     op_record(
         "gammaincc", 2, float_dtypes, jtu.rand_positive, True
+    ),
+    op_record(
+        "gammasgn", 1, float_dtypes, jtu.rand_default, True
     ),
     op_record(
         "erf", 1, float_dtypes, jtu.rand_small_positive, True
@@ -91,6 +95,10 @@ JAX_SPECIAL_FUNCTION_RECORDS = [
     ),
     op_record(
         "factorial", 1, float_dtypes, jtu.rand_default, True
+    ),
+    op_record(
+        "fresnel", 1, float_dtypes,
+        functools.partial(jtu.rand_default, scale=30), True
     ),
     op_record(
         "i0", 1, float_dtypes, jtu.rand_default, True
@@ -114,7 +122,7 @@ JAX_SPECIAL_FUNCTION_RECORDS = [
     ),
     op_record(
         "ndtri", 1, float_dtypes,
-        functools.partial(jtu.rand_uniform, low=0.05, high=0.95), True,
+        functools.partial(jtu.rand_uniform, low=0.0, high=1.0), True,
     ),
     op_record(
         "ndtr", 1, float_dtypes, jtu.rand_default, True
@@ -145,7 +153,12 @@ JAX_SPECIAL_FUNCTION_RECORDS = [
         "rel_entr", 2, float_dtypes, jtu.rand_positive, True,
     ),
     op_record("poch", 2, float_dtypes, jtu.rand_positive, True),
-    op_record("hyp1f1", 3, float_dtypes, functools.partial(jtu.rand_uniform, low=0.5, high=30), True)
+    op_record(
+        "hyp1f1", 3, float_dtypes,
+        functools.partial(jtu.rand_uniform, low=0.5, high=30), True
+    ),
+    op_record("log_softmax", 1, float_dtypes, jtu.rand_default, True),
+    op_record("softmax", 1, float_dtypes, jtu.rand_default, True),
 ]
 
 
@@ -203,7 +216,7 @@ class LaxScipySpcialFunctionsTest(jtu.JaxTestCase):
       n=[0, 1, 2, 3, 10, 50]
   )
   def testScipySpecialFunBernoulli(self, n):
-    dtype = jax.numpy.zeros(0).dtype  # default float dtype.
+    dtype = jnp.zeros(0).dtype  # default float dtype.
     scipy_op = lambda: osp_special.bernoulli(n).astype(dtype)
     lax_op = functools.partial(lsp_special.bernoulli, n)
     args_maker = lambda: []
@@ -211,13 +224,54 @@ class LaxScipySpcialFunctionsTest(jtu.JaxTestCase):
     self._CompileAndCheck(lax_op, args_maker, atol=0, rtol=1E-5)
 
   def testGammaSign(self):
-    # Test that the sign of `gamma` matches at integer-valued inputs.
-    dtype = jax.numpy.zeros(0).dtype  # default float dtype.
+    dtype = jnp.zeros(0).dtype  # default float dtype.
+    typ = dtype.type
+    testcases = [
+      (np.arange(-10, 0).astype(dtype), np.array([np.nan] * 10, dtype=dtype)),
+      (np.nextafter(np.arange(-5, 0).astype(dtype), typ(-np.inf)),
+       np.array([1, -1, 1, -1, 1], dtype=dtype)),
+      (np.nextafter(np.arange(-5, 0).astype(dtype), typ(np.inf)),
+       np.array([-1, 1, -1, 1, -1], dtype=dtype)),
+      (np.arange(0, 10).astype(dtype), np.ones((10,), dtype)),
+      (np.nextafter(np.arange(0, 10).astype(dtype), typ(np.inf)),
+       np.ones((10,), dtype)),
+      (np.nextafter(np.arange(1, 10).astype(dtype), typ(-np.inf)),
+       np.ones((9,), dtype)),
+      (np.array([-np.inf, -0.0, 0.0, np.inf, np.nan]),
+       np.array([np.nan, -1.0, 1.0, 1.0, np.nan]))
+    ]
+    for inp, out in testcases:
+      self.assertArraysEqual(out, lsp_special.gammasgn(inp))
+      self.assertArraysEqual(out, jnp.sign(lsp_special.gamma(inp)))
+      if jtu.parse_version(scipy.__version__) >= (1, 15):
+        self.assertArraysEqual(out, osp_special.gammasgn(inp))
+        self.assertAllClose(osp_special.gammasgn(inp),
+                            lsp_special.gammasgn(inp))
+
+  def testNdtriExtremeValues(self):
+    # Testing at the extreme values (bounds (0. and 1.) and outside the bounds).
+    dtype = jnp.zeros(0).dtype  # default float dtype.
     args_maker = lambda: [np.arange(-10, 10).astype(dtype)]
     rtol = 1E-3 if jtu.test_device_matches(["tpu"]) else 1e-5
-    self._CheckAgainstNumpy(osp_special.gamma, lsp_special.gamma, args_maker, rtol=rtol)
-    self._CompileAndCheck(lsp_special.gamma, args_maker, rtol=rtol)
+    self._CheckAgainstNumpy(osp_special.ndtri, lsp_special.ndtri, args_maker, rtol=rtol)
+    self._CompileAndCheck(lsp_special.ndtri, args_maker, rtol=rtol)
 
+  def testRelEntrExtremeValues(self):
+    # Testing at the extreme values (bounds (0. and 1.) and outside the bounds).
+    dtype = jnp.zeros(0).dtype  # default float dtype.
+    args_maker = lambda: [np.array([-2, -2, -2, -1, -1, -1, 0, 0, 0]).astype(dtype),
+                          np.array([-1, 0, 1, -1, 0, 1, -1, 0, 1]).astype(dtype)]
+    rtol = 1E-3 if jtu.test_device_matches(["tpu"]) else 1e-5
+    self._CheckAgainstNumpy(osp_special.rel_entr, lsp_special.rel_entr, args_maker, rtol=rtol)
+    self._CompileAndCheck(lsp_special.rel_entr, args_maker, rtol=rtol)
+
+  def testBetaParameterDeprecation(self):
+    with self.assertNoWarnings():
+      lsp_special.beta(1, 1)
+      lsp_special.beta(1, b=1)
+      lsp_special.beta(a=1, b=1)
+    with self.assertRaises(TypeError):
+      lsp_special.beta(x=1, y=1)
 
 
 if __name__ == "__main__":

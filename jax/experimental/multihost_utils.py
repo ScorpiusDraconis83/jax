@@ -16,13 +16,12 @@
 from __future__ import annotations
 
 from functools import partial, lru_cache
-from typing import Optional
 import zlib
 
 from typing import Any
 import jax
 import jax.numpy as jnp
-from jax.tree_util import tree_flatten, tree_map, tree_unflatten
+from jax.tree_util import tree_flatten, tree_unflatten
 from jax._src import core
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
@@ -32,7 +31,6 @@ from jax._src import sharding_impls
 from jax._src.interpreters import pxla
 from jax.interpreters import xla
 from jax._src import pjit as pjit_lib
-from jax.experimental.pjit import pjit
 from jax.sharding import PartitionSpec as P
 from jax._src import distributed
 from jax._src.util import safe_zip
@@ -40,7 +38,7 @@ import numpy as np
 
 
 def _psum(x: Any) -> Any:
-  return jax.tree_map(partial(jnp.sum, axis=0), x)
+  return jax.tree.map(partial(jnp.sum, axis=0), x)
 
 
 def broadcast_one_to_all(in_tree: Any, is_source: bool | None = None) -> Any:
@@ -57,6 +55,9 @@ def broadcast_one_to_all(in_tree: Any, is_source: bool | None = None) -> Any:
     A pytree matching in_tree where the leaves now all contain the data from the
     first host.
   """
+  if jax.process_count() == 1:
+    return jax.tree.map(np.asarray, in_tree)
+
   if is_source is None:
     is_source = jax.process_index() == 0
 
@@ -74,12 +75,12 @@ def broadcast_one_to_all(in_tree: Any, is_source: bool | None = None) -> Any:
     return host_local_array_to_global_array(inp, global_mesh, pspec)
 
   def post_jit(x):
-    return np.asarray(x.addressable_data(0))
+    return jax.device_get(x.addressable_data(0))
 
-  in_tree = jax.tree_map(pre_jit, in_tree)
+  in_tree = jax.tree.map(pre_jit, in_tree)
   out_tree = jax.jit(_psum, out_shardings=jax.sharding.NamedSharding(
       global_mesh, P()))(in_tree)
-  return jax.tree_map(post_jit, out_tree)
+  return jax.tree.map(post_jit, out_tree)
 
 
 def sync_global_devices(name: str):
@@ -98,11 +99,12 @@ def _handle_array_process_allgather(inp, tiled):
   if isinstance(inp, array.ArrayImpl) and not inp.is_fully_addressable:
     reps = sharding_impls.GSPMDSharding.get_replicated(
         inp.sharding._device_assignment)
-    out = pjit(_identity_fn, out_shardings=reps)(inp)
+    out = jax.jit(_identity_fn, out_shardings=reps)(inp)
   else:
     # All inputs here will be fully addressable.
     if jax.process_count() == 1:
-      return np.asarray(inp)
+      out = np.asarray(inp)
+      return np.expand_dims(out, axis=0) if not tiled else out
 
     devices = np.array(jax.devices()).reshape(jax.process_count(),
                                               jax.local_device_count())
@@ -121,8 +123,8 @@ def _handle_array_process_allgather(inp, tiled):
     bufs = [jax.device_put(host_np_arr, d) for d in jax.local_devices()]
     global_arr = array.make_array_from_single_device_arrays(
         global_aval.shape, s, bufs)
-    with global_mesh:
-      out = pjit(_identity_fn, out_shardings=None)(global_arr)
+    out = jax.jit(_identity_fn,
+                  out_shardings=jax.NamedSharding(global_mesh, P()))(global_arr)
 
   return np.asarray(out.addressable_data(0))
 
@@ -148,7 +150,7 @@ def process_allgather(in_tree: Any, tiled: bool = False) -> Any:
 
   def _pjit(inp):
     return _handle_array_process_allgather(inp, tiled)
-  return jax.tree_map(_pjit, in_tree)
+  return jax.tree.map(_pjit, in_tree)
 
 
 def assert_equal(in_tree, fail_message: str = ''):
@@ -261,13 +263,56 @@ def host_local_array_to_global_array(
     local_inputs: Any, global_mesh: jax.sharding.Mesh, pspecs: Any):
   r"""Converts a host local value to a globally sharded jax.Array.
 
+  This function takes host-local data (which might be different
+  across hosts), and populates a global array with this data, where each
+  device on each host, get the appropriate slice of the data according to
+  sharding defined by the global_mesh/pspects.
+
+  For example:
+
+  >>> global_mesh = jax.sharding.Mesh(jax.devices(), 'x')
+  >>> pspecs = jax.sharding.PartitionSpec('x')
+  >>> host_id = jax.process_index()
+  >>> arr = host_local_array_to_global_array(np.arange(4) * host_id, mesh, pspecs)  # NB: assumes jax.local_device_count() divides 4.   # doctest: +SKIP
+
+  The resulting array will have the shape (4 * num_processes) and will
+  have distributed value of: (0, 1, 2, 3, 0, 2, 4, 6, 0, 3, 6, 9, ... ),
+  where each slice np.arange(4) * host_id will be partitioned across the
+  corresponding host's devices.
+
+  Similarly:
+
+  >>> mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(jax.process_count(), jax.local_device_count()), ['host', 'dev'])
+  >>> pspecs = jax.sharding.PartitionSpec('host')
+  >>> host_id = jax.process_index()
+  >>> arr = host_local_array_to_global_array(np.arange(4) * host_id, mesh, pspecs)  # doctest: +SKIP
+
+  will create the same distributed value (0, 1, 2, 3, 0, 2, 4, 6, ...),
+  however each slice np.arange(4) * i will be *replicated* across corresponding
+  host devices.
+
+  On the other hand, if pspecs = PartitionSpec(), which means
+  replication across all axes, then this snippet:
+
+  >>> pspecs = jax.sharding.PartitionSpec()
+  >>> arr = host_local_array_to_global_array(np.arange(4), mesh, pspecs)  # doctest: +SKIP
+
+  will have the shape (4,) and the value (0, 1, 2, 3) will be replicated
+  across all hosts and devices.
+
+  It is an undefined behavior to have not identical local_inputs with pspec
+  indicating data replication.
+
   You can use this function to transition to jax.Array. Using jax.Array with
   pjit has the same semantics of using GDA with pjit i.e. all jax.Array
   inputs to pjit should be globally shaped.
 
   If you are currently passing host local values to pjit, you can use this
   function to convert your host local values to global Arrays and then pass that
-  to pjit. Example usage.
+  to pjit.
+
+
+  Example usage.
 
   >>> from jax.experimental import multihost_utils # doctest: +SKIP
   >>>
@@ -278,10 +323,20 @@ def host_local_array_to_global_array(
   >>>
   >>> host_local_output = multihost_utils.global_array_to_host_local_array(global_out, mesh, out_pspecs) # doctest: +SKIP
 
+  Please note ths function requires global mesh to be a continuous mesh, meaning
+  that  devices that belong to each host should form a subcube in this mesh.
+  To move local data to global array with non-continuous mesh use
+  jax.make_array_from_callback or jax.make_array_from_single_device_arrays
+  instead.
+
   Args:
     local_inputs: A Pytree of host local values.
-    global_mesh: A jax.sharding.Mesh object.
+    global_mesh: A jax.sharding.Mesh object. The mesh must be a contiguous mesh,
+    that is all hosts' devices must form a subcube in this mesh.
     pspecs: A Pytree of jax.sharding.PartitionSpec's.
+
+  Returns:
+    A pytree of global arrays.
   """
   flat_inps, in_tree = tree_flatten(local_inputs)
   in_pspecs = _flatten_pspecs('input pspecs', in_tree,
@@ -305,22 +360,18 @@ ad.deflinear2(host_local_array_to_global_array_p,
               lambda ct, _, **params: (
                   host_local_array_to_global_array_p.bind(ct, **params),))
 
-def ltg_batcher(insert_axis, spmd_axis_name, axis_size,
-                axis_name, main_type, vals_in, dims_in,
-                global_mesh, pspec):
+def ltg_batcher(insert_axis, axis_data, vals_in, dims_in, global_mesh, pspec):
   x, = vals_in
   d, = dims_in
-  new_parts = None if spmd_axis_name is None else spmd_axis_name
+  new_parts = None if axis_data.spmd_name is None else axis_data.spmd_name
   new_pspec = list(pspec)
   new_pspec.insert(d, new_parts)
-  new_pspec = P(*new_pspec)  # type: ignore
+  new_pspec = P(*new_pspec)
   y = host_local_array_to_global_array_p.bind(
       x, global_mesh=global_mesh, pspec=new_pspec)
   return y, d
-batching.spmd_axis_primitive_batchers[host_local_array_to_global_array_p] = partial(
+batching.fancy_primitive_batchers[host_local_array_to_global_array_p] = partial(
     ltg_batcher, False)
-batching.axis_primitive_batchers[host_local_array_to_global_array_p] = partial(
-    ltg_batcher, False, None)
 
 def _ltg_lowering(ctx, x, *, global_mesh, pspec):
   return [x]
@@ -371,21 +422,27 @@ def global_array_to_host_local_array(
 
   You can use this function to convert the globally shaped `jax.Array` output
   from pjit to host local values again so that the transition to jax.Array can
-  be a mechanical change. Example usage
+  be a mechanical change.
 
-  >> from jax.experimental import multihost_utils # doctest: +SKIP
-  >>
-  >> global_inputs = multihost_utils.host_local_array_to_global_array(host_local_inputs, global_mesh, in_pspecs) # doctest: +SKIP
-  >>
-  >> with mesh: # doctest: +SKIP
-  >>   global_out = pjitted_fun(global_inputs) # doctest: +SKIP
-  >>
-  >> host_local_output = multihost_utils.global_array_to_host_local_array(global_out, mesh, out_pspecs) # doctest: +SKIP
+  Example usage:
+
+  >>> from jax.experimental import multihost_utils # doctest: +SKIP
+  >>>
+  >>> global_inputs = multihost_utils.host_local_array_to_global_array(host_local_inputs, global_mesh, in_pspecs) # doctest: +SKIP
+  >>>
+  >>> with mesh: # doctest: +SKIP
+  ...   global_out = pjitted_fun(global_inputs) # doctest: +SKIP
+  >>>
+  >>> host_local_output = multihost_utils.global_array_to_host_local_array(global_out, mesh, out_pspecs) # doctest: +SKIP
 
   Args:
     global_inputs: A Pytree of global jax.Array's.
-    global_mesh: A jax.sharding.Mesh object.
-    pspecs: A Pytree of jax.sharding.PartitionSpec's.
+    global_mesh: A :class:`jax.sharding.Mesh` object. The mesh must be contiguous
+      meaning all local devices of the host must form a subcube.
+    pspecs: A Pytree of :class:`jax.sharding.PartitionSpec` objects.
+
+  Returns:
+    A Pytree of host local arrays.
   """
   flat_inps, out_tree = tree_flatten(global_inputs)
   out_pspecs = _flatten_pspecs('output pspecs', out_tree,

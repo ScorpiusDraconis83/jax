@@ -12,53 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
-from jax._src import xla_bridge
 from jax._src import test_util as jtu
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.experimental.shard_alike import shard_alike
 from jax.experimental.shard_map import shard_map
-from jax._src.lib import xla_extension_version
 
-from jax import config
-config.parse_flags_with_absl()
-
-prev_xla_flags = None
+jax.config.parse_flags_with_absl()
+jtu.request_cpu_devices(8)
 
 
-def setUpModule():
-  global prev_xla_flags
-  prev_xla_flags = os.getenv("XLA_FLAGS")
-  flags_str = prev_xla_flags or ""
-  # Don't override user-specified device count, or other XLA flags.
-  if "xla_force_host_platform_device_count" not in flags_str:
-    os.environ["XLA_FLAGS"] = (flags_str +
-                               " --xla_force_host_platform_device_count=8")
-  # Clear any cached backends so new CPU backend will pick up the env var.
-  xla_bridge.get_backend.cache_clear()
+class ShardAlikeDownstreamTest(jtu.JaxTestCase):
 
-def tearDownModule():
-  if prev_xla_flags is None:
-    del os.environ["XLA_FLAGS"]
-  else:
-    os.environ["XLA_FLAGS"] = prev_xla_flags
-  xla_bridge.get_backend.cache_clear()
+  def test_full_like(self):
+    x = jnp.arange(16, dtype='float32').reshape(8, 2)
+    mesh = jtu.create_mesh((8,), ("i",))
+    x = jax.device_put(x, NamedSharding(mesh, P('i', None)))
+    y = jnp.full_like(x, 1)
+    self.assertEqual(x.sharding, y.sharding)
 
 
 class ShardAlikeTest(jtu.JaxTestCase):
 
   def setUp(self):
     super().setUp()
-    if xla_extension_version < 227:
-      self.skipTest('Requires xla_extension_version >= 227')
 
   def test_basic(self):
-    mesh = jtu.create_global_mesh((2, 2), ('x', 'y'))
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
     np_inp = np.arange(16).reshape(8, 2)
     s = NamedSharding(mesh, P('x', 'y'))
     inp = jax.device_put(np_inp, s)
@@ -75,7 +58,7 @@ class ShardAlikeTest(jtu.JaxTestCase):
     self.assertArraysEqual(out, np_inp * np_inp * 4)
 
   def test_output_sharded_alike_input(self):
-    mesh = jtu.create_global_mesh((2, 1), ('x', 'y'))
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
     np_inp = np.arange(16).reshape(8, 2)
     s = NamedSharding(mesh, P('x', 'y'))
     inp = jax.device_put(np_inp, s)
@@ -90,7 +73,7 @@ class ShardAlikeTest(jtu.JaxTestCase):
     self.assertArraysEqual(out, np_inp * 2)
 
   def test_arange_shard_alike_jit(self):
-    mesh = jtu.create_global_mesh((2, 1), ('x', 'y'))
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
     np_inp = np.arange(16).reshape(8, 2)
     s = NamedSharding(mesh, P('x', 'y'))
     inp = jax.device_put(np_inp, s)
@@ -105,7 +88,7 @@ class ShardAlikeTest(jtu.JaxTestCase):
     self.assertArraysEqual(out, np_inp)
 
   def test_different_shapes(self):
-    mesh = jtu.create_global_mesh((2, 1), ('x', 'y'))
+    mesh = jtu.create_mesh((2, 1), ('x', 'y'))
     np_inp = np.arange(16).reshape(8, 2)
     s = NamedSharding(mesh, P('x',))
     inp = jax.device_put(np_inp, s)
@@ -120,7 +103,7 @@ class ShardAlikeTest(jtu.JaxTestCase):
       f(inp)
 
   def test_double_shard_alike(self):
-    mesh = jtu.create_global_mesh((2, 2), ('x', 'y'))
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
     np_inp = np.arange(16).reshape(8, 2)
     s = NamedSharding(mesh, P('x', 'y'))
     inp = jax.device_put(np_inp, s)
@@ -138,7 +121,7 @@ class ShardAlikeTest(jtu.JaxTestCase):
     self.assertEqual(out2.sharding, NamedSharding(mesh, P('x')))
 
   def test_shard_like_eager(self):
-    mesh = jtu.create_global_mesh((4, 1), ('x', 'y'))
+    mesh = jtu.create_mesh((4, 1), ('x', 'y'))
     np_inp = np.arange(16).reshape(8, 2)
     s = NamedSharding(mesh, P('x', 'y'))
     inp = jax.device_put(np_inp, s)
@@ -152,7 +135,7 @@ class ShardAlikeTest(jtu.JaxTestCase):
     self.assertArraysEqual(out, np_inp)
 
   def test_shard_map(self):
-    mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
+    mesh = jtu.create_mesh((4, 2), ('x', 'y'))
     np_inp = np.arange(16).reshape(8, 2)
     s = NamedSharding(mesh, P('x', 'y'))
     inp = jax.device_put(np_inp, s)
@@ -174,7 +157,7 @@ class ShardAlikeTest(jtu.JaxTestCase):
     self.assertEqual(out2.sharding, s)
 
   def test_grad(self):
-    mesh = jtu.create_global_mesh((4,), ('x',))
+    mesh = jtu.create_mesh((4,), ('x',))
     np_inp = np.arange(8.)
     s = NamedSharding(mesh, P('x'))
     inp = jax.device_put(np_inp, s)
@@ -195,7 +178,7 @@ class ShardAlikeTest(jtu.JaxTestCase):
     jax.grad(jax.jit(f))(inp)  # doesn't crash
 
   def test_shard_input_as_output(self):
-    mesh = jtu.create_global_mesh((4,), ('x',))
+    mesh = jtu.create_mesh((4,), ('x',))
     np_inp = np.arange(8.)
     s = NamedSharding(mesh, P('x'))
 
@@ -208,7 +191,7 @@ class ShardAlikeTest(jtu.JaxTestCase):
     with jtu.count_pjit_cpp_cache_miss() as count:
       f(np_inp)
       out1, out2 = f(np_inp)
-    self.assertEqual(count[0], 1)
+    self.assertEqual(count(), 1)
     self.assertTrue(s.is_equivalent_to(out1.sharding, np_inp.ndim))
     self.assertTrue(s.is_equivalent_to(out2.sharding, np_inp.ndim))
 
@@ -220,29 +203,72 @@ class ShardAlikeTest(jtu.JaxTestCase):
     with jtu.count_pjit_cpp_cache_miss() as count:
       g(arr)
       out3, out4 = g(arr)
-    self.assertEqual(count[0], 1)
+    self.assertEqual(count(), 1)
     self.assertEqual(out3.sharding, s)
     self.assertEqual(out4.sharding, s)
 
   def test_shard_alike_inputs(self):
-    mesh = jtu.create_global_mesh((2,), ('x',))
+    mesh = jtu.create_mesh((2,), ('x',))
     np_inp = np.arange(8.)
     s = NamedSharding(mesh, P('x'))
-    rep_s = NamedSharding(mesh, P())
     arr = jax.device_put(np_inp, s)
-    arr2 = jax.device_put(np_inp, rep_s)
 
     def f(x, y):
       return shard_alike(x, y)
 
-    eager_out1, eager_out2 = f(arr, arr2)
+    eager_out1, eager_out2 = f(arr, np_inp)
     self.assertEqual(eager_out1.sharding, s)
     self.assertEqual(eager_out2.sharding, s)
 
-    out1, out2 = jax.jit(f)(arr, arr2)
+    out1, out2 = jax.jit(f)(arr, np_inp)
     self.assertEqual(out1.sharding, s)
     self.assertEqual(out2.sharding, s)
 
+  def test_vmap_one_mapped(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    np_inp = np.arange(2)
+    s = NamedSharding(mesh, P('y'))
+    inp = jax.device_put(np_inp, s)
+
+    @jax.jit
+    def f(x):
+      def _shard_slice_like_arg(s):
+        sharded_s, _ = shard_alike(s, x)
+        return sharded_s
+
+      replicated_x = jnp.tile(x, [8, 1])  # shape == (8, 2)
+      return jax.vmap(_shard_slice_like_arg, in_axes=0)(replicated_x)
+
+    out = f(inp)
+    self.assertEqual(out.sharding, NamedSharding(mesh, P(None, 'y')))
+    self.assertArraysEqual(out, np.tile(np_inp, [8, 1]))
+
+  def test_vmap_both_mapped(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    np_inp = np.arange(16).reshape(8, 2)
+    s = NamedSharding(mesh, P('x', 'y'))
+    inp1 = jax.device_put(np_inp, s)
+
+    np_inp2 = np.arange(16).reshape(2, 8)
+    inp2 = jax.device_put(np_inp2, NamedSharding(mesh, P('y', 'x')))
+
+    @jax.jit
+    def f(x, y):
+      return jax.vmap(shard_alike, in_axes=(0, 1))(x, y)
+
+    out1, out2 = f(inp1, inp2)
+    self.assertEqual(out1.sharding, s)
+    self.assertEqual(out2.sharding, s)
+    self.assertArraysEqual(out1, np_inp)
+    self.assertArraysEqual(out2, np_inp2.T)
+
+  def test_sharding_preserverd_single_device(self):
+    mesh = jax.sharding.Mesh([jax.devices()[0]], "x")
+    s = NamedSharding(mesh, P("x"))
+
+    x = jax.device_put(np.arange(8), s)
+    _, y = shard_alike(x, jnp.arange(8))
+    self.assertEqual(y.sharding, s)
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

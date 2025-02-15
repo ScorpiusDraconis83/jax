@@ -1,4 +1,6 @@
-# Profiling JAX programs
+# Profiling computation
+
+<!--* freshness: { reviewed: '2024-03-18' } *-->
 
 ## Viewing program traces with Perfetto
 
@@ -11,7 +13,7 @@ check out the Tensorboard profiler below.
 ```python
 with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
   # Run the operations to be profiled
-  key = jax.random.PRNGKey(0)
+  key = jax.random.key(0)
   x = jax.random.normal(key, (5000, 5000))
   y = x @ x
   y.block_until_ready()
@@ -50,7 +52,7 @@ active for a portion of your script, you can shut it down by calling
 `jax.profiler.stop_server()`.
 
 Once the script is running and after the profiler server has started, we can
-manually capture an trace by running:
+manually capture and trace by running:
 ```bash
 $ python -m jax.collect_profile <port> <duration_in_ms>
 ```
@@ -91,6 +93,12 @@ plugins" error described {ref}`below <multiple_installs>`. See
 <https://www.tensorflow.org/guide/profiler> for more information on installing
 TensorBoard.
 
+Nightly version of TensorBoard profiler requires nightly tensorflow and
+tensorboard
+```shell
+pip install tf-nightly tb-nightly tbp-nightly
+```
+
 ### Programmatic capture
 
 You can instrument your code to capture a profiler trace via the
@@ -107,7 +115,7 @@ import jax
 jax.profiler.start_trace("/tmp/tensorboard")
 
 # Run the operations to be profiled
-key = jax.random.PRNGKey(0)
+key = jax.random.key(0)
 x = jax.random.normal(key, (5000, 5000))
 y = x @ x
 y.block_until_ready()
@@ -126,7 +134,7 @@ alternative to `start_trace` and `stop_trace`:
 import jax
 
 with jax.profiler.trace("/tmp/tensorboard"):
-  key = jax.random.PRNGKey(0)
+  key = jax.random.key(0)
   x = jax.random.normal(key, (5000, 5000))
   y = x @ x
   y.block_until_ready()
@@ -215,16 +223,6 @@ from a running program.
 
    You can also use the `memory_viewer`, `op_profile`, and `graph_viewer`
    tools.<br /><br />
-
-### Concurrent kernel tracing on GPU
-
-By default, traces captured on GPU in a mode that prevents CUDA kernels from
-running concurrently. This allows for more accurate kernel timings, but removes
-any concurrency between streams (for example, between compute and
-communication). To enable concurrent kernel tracing, set the environment
-variable `TF_GPU_CUPTI_FORCE_CONCURRENT_KERNEL=1` when launching the JAX
-program.
-
 
 ### Adding custom trace events
 

@@ -30,7 +30,6 @@ package(
 py_library(
     name = "jax2tf",
     srcs = ["__init__.py"],
-    srcs_version = "PY3",
     visibility = ["//visibility:public"],
     deps = [":jax2tf_internal"],
 )
@@ -42,12 +41,10 @@ py_library(
         "impl_no_xla.py",
         "jax2tf.py",
     ],
-    srcs_version = "PY3",
     # TODO: b/255503696: enable pytype
     tags = ["pytype_unchecked_annotations"],
     visibility = jax_visibility("jax2tf_internal"),
     deps = [
         "//jax",
-        "//jax/experimental/export",
     ] + py_deps("numpy") + py_deps("tensorflow_core") + jax2tf_deps,
 )

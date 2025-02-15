@@ -16,9 +16,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-import sys
-from typing import Callable, Union
+from collections.abc import Callable, Sequence
+from typing import Union
 import warnings
 
 import numpy as np
@@ -30,17 +29,15 @@ from jax._src import core
 from jax._src import dtypes
 from jax._src import util
 from jax._src.lax import lax as lax_internal
+from jax._src.numpy import indexing
 from jax._src.numpy import lax_numpy as jnp
 from jax._src.numpy import reductions
 from jax._src.numpy.util import check_arraylike, promote_dtypes
 from jax._src.typing import Array, ArrayLike
 
 
-if sys.version_info >= (3, 10):
-    from types import EllipsisType
-    SingleIndex = int | slice | Sequence[int] | Array | EllipsisType | None
-else:
-    SingleIndex = Union[int, slice, Sequence[int], Array, None]
+from types import EllipsisType
+SingleIndex = int | slice | Sequence[int] | Array | EllipsisType | None
 Index = Union[SingleIndex, tuple[SingleIndex, ...]]
 Scalar = Union[complex, float, int, np.number]
 
@@ -76,7 +73,7 @@ def _scatter_update(x, idx, y, scatter_op, indices_are_sorted,
 
   # XLA gathers and scatters are very similar in structure; the scatter logic
   # is more or less a transpose of the gather equivalent.
-  treedef, static_idx, dynamic_idx = jnp._split_index_for_jit(idx, x.shape)
+  treedef, static_idx, dynamic_idx = indexing.split_index_for_jit(idx, x.shape)
   return _scatter_impl(x, y, scatter_op, treedef, static_idx, dynamic_idx,
                        indices_are_sorted, unique_indices, mode,
                        normalize_indices)
@@ -100,9 +97,9 @@ def _scatter_impl(x, y, scatter_op, treedef, static_idx, dynamic_idx,
       "In future JAX releases this will result in an error.",
       FutureWarning)
 
-  idx = jnp._merge_static_and_dynamic_indices(treedef, static_idx, dynamic_idx)
-  indexer = jnp._index_to_gather(jnp.shape(x), idx,
-                                 normalize_indices=normalize_indices)
+  idx = indexing.merge_static_and_dynamic_indices(treedef, static_idx, dynamic_idx)
+  indexer = indexing.index_to_gather(jnp.shape(x), idx,
+                                     normalize_indices=normalize_indices)
 
   # Avoid calling scatter if the slice shape is empty, both as a fast path and
   # to handle cases like zeros(0)[array([], int32)].
@@ -118,20 +115,26 @@ def _scatter_impl(x, y, scatter_op, treedef, static_idx, dynamic_idx,
   if indexer.reversed_y_dims:
     y = lax.rev(y, indexer.reversed_y_dims)
 
+  if indexer.scalar_bool_dims:
+    x = lax.expand_dims(x, indexer.scalar_bool_dims)
+
   # Transpose the gather dimensions into scatter dimensions (cf.
   # lax._gather_transpose_rule)
   dnums = lax.ScatterDimensionNumbers(
     update_window_dims=indexer.dnums.offset_dims,
     inserted_window_dims=indexer.dnums.collapsed_slice_dims,
-    scatter_dims_to_operand_dims=indexer.dnums.start_index_map
+    scatter_dims_to_operand_dims=indexer.dnums.start_index_map,
+    operand_batching_dims=indexer.dnums.operand_batching_dims,
+    scatter_indices_batching_dims=indexer.dnums.start_indices_batching_dims,
   )
   out = scatter_op(
     x, indexer.gather_indices, y, dnums,
     indices_are_sorted=indexer.indices_are_sorted or indices_are_sorted,
     unique_indices=indexer.unique_indices or unique_indices,
     mode=mode)
+  if indexer.scalar_bool_dims:
+    out = lax.squeeze(out, indexer.scalar_bool_dims)
   return lax_internal._convert_element_type(out, dtype, weak_type)
-
 
 
 def _get_identity(op, dtype):
@@ -143,14 +146,14 @@ def _get_identity(op, dtype):
   elif op is lax.scatter_min:
     if dtype == dtypes.bool_:
       return True
-    elif jnp.issubdtype(dtype, jnp.integer):
-      return jnp.iinfo(dtype).max
+    elif dtypes.issubdtype(dtype, np.integer):
+      return dtypes.iinfo(dtype).max
     return float('inf')
   elif op is lax.scatter_max:
     if dtype == dtypes.bool_:
       return False
-    elif jnp.issubdtype(dtype, jnp.integer):
-      return jnp.iinfo(dtype).min
+    elif dtypes.issubdtype(dtype, np.integer):
+      return dtypes.iinfo(dtype).min
     return -float('inf')
   else:
     raise ValueError(f"Unrecognized op: {op}")

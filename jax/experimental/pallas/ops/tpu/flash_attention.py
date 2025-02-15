@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from typing import Any, NamedTuple
 
 import jax
@@ -43,8 +44,8 @@ class SegmentIds(NamedTuple):
     kv: segment ids along the KV sequence.
   """
 
-  q: jax.Array  # [q_seq_len]
-  kv: jax.Array  # [kv_seq_len]
+  q: jax.Array  # [batch_size, q_seq_len]
+  kv: jax.Array  # [batch_size, kv_seq_len]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -174,6 +175,23 @@ def flash_attention(
     raise ValueError(
         f"KV sequence length mismatch: got {kv_seq_len} and {kv_seq_len_v}"
     )
+  if ab is not None:
+    if ab.shape != (batch_size, num_heads, q_seq_len, kv_seq_len):
+      raise ValueError(
+          f"Attention bias shape mismatch: expected ({batch_size=},"
+          f" {num_heads=}, {q_seq_len=}, {kv_seq_len=}), got {ab.shape}"
+      )
+  if segment_ids is not None:
+    if segment_ids.q.shape != (batch_size, q_seq_len):
+      raise ValueError(
+          f"Q segment ids shape mismatch: expected ({batch_size=},"
+          f" {q_seq_len=},), got {segment_ids.q.shape}"
+      )
+    if segment_ids.kv.shape != (batch_size, kv_seq_len):
+      raise ValueError(
+          f"KV segment ids shape mismatch: expected ({batch_size=},"
+          f" {kv_seq_len=},), got {segment_ids.kv.shape}"
+      )
   if block_sizes is None:
     block_sizes = BlockSizes.get_default(
         batch_size, num_heads, q_seq_len, kv_seq_len, d_model
@@ -330,11 +348,11 @@ def _flash_attention_kernel_single_batch(
     q_segment_ids_tile_ref,
     kv_segment_ids_tile_ref,  # Input arrays
     o_tile_ref,  # Output arrays
+    l_ref,
+    m_ref,
     m_scratch_ref,
     l_scratch_ref,
     acc_scratch_ref,
-    l_ref: Any | None = None,
-    m_ref: Any | None = None,
     *,
     causal,
     sm_scale,
@@ -479,9 +497,6 @@ def _flash_attention_kernel_single_batch_single_step(
     q_segment_ids_tile_ref,
     kv_segment_ids_tile_ref,  # Input arrays
     o_tile_ref,  # Output arrays
-    m_scratch_ref,
-    l_scratch_ref,
-    acc_scratch_ref,
     l_ref: Any | None = None,
     m_ref: Any | None = None,
     *,
@@ -494,8 +509,6 @@ def _flash_attention_kernel_single_batch_single_step(
   block_k_major = k_tile_ref.shape[2]
   block_q = q_tile_ref.shape[2]
 
-  scratch_refs = (m_scratch_ref, l_scratch_ref, acc_scratch_ref)
-  assert all(ref is None for ref in scratch_refs)
   assert kv_seq_len == block_k_major == block_k
 
   q = q_tile_ref[batch_idx]  # [block_q, head_dim]
@@ -551,6 +564,35 @@ def _flash_attention_kernel_single_batch_single_step(
   o_tile_ref[batch_idx] = jax.lax.dot(
       p.astype(v.dtype), v, preferred_element_type=jnp.float32
   ).astype(o_tile_ref.dtype)
+
+
+def _bytes(x: jax.Array | jax.ShapeDtypeStruct) -> int:
+  return math.prod(x.shape) * x.dtype.itemsize
+
+
+def _fwd_cost_estimate(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    ab: jax.Array | None,
+    segment_ids: SegmentIds | None,
+    *,
+    causal: bool,
+    sm_scale: jax.Array | None,
+    kernel_inputs_specs,
+    kernel_outputs_specs,
+) -> pl.CostEstimate | None:
+  body_cost = pl.estimate_cost(
+    mha_reference,
+    q, k, v, ab, segment_ids, causal=causal, sm_scale=sm_scale
+  )
+  input_bytes = sum(_bytes(x) for x in jax.tree.leaves(kernel_inputs_specs))
+  output_bytes = sum(_bytes(x) for x in jax.tree.leaves(kernel_outputs_specs))
+  return pl.CostEstimate(
+      flops=body_cost.flops,
+      transcendentals=body_cost.transcendentals,
+      bytes_accessed=input_bytes + output_bytes,
+  )
 
 
 def _flash_attention_impl(
@@ -636,28 +678,21 @@ def _flash_attention_impl(
   )
   out_shape = jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
   out_shape = [out_shape]
-  out_specs = [pl.BlockSpec(o_index_map, (block_b, 1, block_q, head_dim))]
+  out_specs = [pl.BlockSpec((block_b, 1, block_q, head_dim), o_index_map)]
 
   if block_k != kv_seq_len:
-    scratch_shape = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
-    m_scratch = scratch_shape((block_b, 1, block_q, MIN_BLOCK_SIZE))
-    l_scratch = scratch_shape((block_b, 1, block_q, MIN_BLOCK_SIZE))
-    acc_scratch = scratch_shape((block_b, 1, block_q, head_dim))
-    out_shape += [m_scratch, l_scratch, acc_scratch]
-    out_specs += [
-        pl.BlockSpec(lambda *_: (0, 0, 0, 0), m_scratch.shape),
-        pl.BlockSpec(lambda *_: (0, 0, 0, 0), l_scratch.shape),
-        pl.BlockSpec(lambda *_: (0, 0, 0, 0), acc_scratch.shape),
-    ]
+    m_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
+    l_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
+    acc_scratch = pltpu.VMEM((block_b, 1, block_q, head_dim), jnp.float32)
+    scratch_shapes = [m_scratch, l_scratch, acc_scratch]
   else:
-    out_shape += [None, None, None]
-    out_specs += [None, None, None]
+    scratch_shapes = []
 
   if save_residuals:
     out_specs = [
         *out_specs,
-        pl.BlockSpec(lm_index_map, (block_b, 1, block_q, MIN_BLOCK_SIZE)),
-        pl.BlockSpec(lm_index_map, (block_b, 1, block_q, MIN_BLOCK_SIZE)),
+        pl.BlockSpec((block_b, 1, block_q, MIN_BLOCK_SIZE), lm_index_map),
+        pl.BlockSpec((block_b, 1, block_q, MIN_BLOCK_SIZE), lm_index_map),
     ]
     l = jax.ShapeDtypeStruct(
         (batch_size, num_heads, q_seq_len, MIN_BLOCK_SIZE), dtype=jnp.float32
@@ -666,9 +701,12 @@ def _flash_attention_impl(
         (batch_size, num_heads, q_seq_len, MIN_BLOCK_SIZE), dtype=jnp.float32
     )
     out_shape = (*out_shape, l, m)
+  else:
+    out_specs = [*out_specs, None, None]
+    out_shape = (*out_shape, None, None)
 
   ab_block_spec = (
-      pl.BlockSpec(ab_index_map, (block_b, 1, block_q, block_k_major))
+      pl.BlockSpec((block_b, 1, block_q, block_k_major), ab_index_map)
       if ab is not None else None)
 
   q_segment_ids_spec = kv_segment_ids_spec = None
@@ -694,10 +732,10 @@ def _flash_attention_impl(
       return (batch_index, 0, next_kv_index)
 
     q_segment_ids_spec = pl.BlockSpec(
-        q_segment_ids_index_map, (block_b, block_q, NUM_LANES)
+        (block_b, block_q, NUM_LANES), q_segment_ids_index_map
     )
     kv_segment_ids_spec = pl.BlockSpec(
-        kv_segment_ids_index_map, (block_b, NUM_SUBLANES, block_k_major)
+        (block_b, NUM_SUBLANES, block_k_major), kv_segment_ids_index_map
     )
 
     q_segment_ids = jax.lax.broadcast_in_dim(
@@ -718,9 +756,9 @@ def _flash_attention_impl(
     )
 
   in_specs = [
-      pl.BlockSpec(q_index_map, (block_b, 1, block_q, head_dim)),
-      pl.BlockSpec(kv_index_map, (block_b, 1, block_k_major, head_dim)),
-      pl.BlockSpec(kv_index_map, (block_b, 1, block_k_major, head_dim)),
+      pl.BlockSpec((block_b, 1, block_q, head_dim), q_index_map),
+      pl.BlockSpec((block_b, 1, block_k_major, head_dim), kv_index_map),
+      pl.BlockSpec((block_b, 1, block_k_major, head_dim), kv_index_map),
       ab_block_spec,
       q_segment_ids_spec,
       kv_segment_ids_spec,
@@ -728,13 +766,33 @@ def _flash_attention_impl(
 
   o, *aux = pl.pallas_call(
       kernel,
+      grid_spec=pltpu.PrefetchScalarGridSpec(
+          num_scalar_prefetch=0,
+          grid=grid,
+          in_specs=in_specs,
+          out_specs=out_specs,
+          scratch_shapes=scratch_shapes,
+      ),
       out_shape=out_shape,
-      in_specs=in_specs,
-      out_specs=out_specs,
-      grid=grid,
       debug=debug,
-      mosaic_params=dict(
-          dimension_semantics=("parallel", "parallel", "parallel", "arbitrary")
+      compiler_params=pltpu.TPUCompilerParams(
+          dimension_semantics=(
+              "parallel",
+              "parallel",
+              "parallel",
+              "arbitrary",
+          )
+      ),
+      cost_estimate=_fwd_cost_estimate(
+          q,
+          k,
+          v,
+          ab,
+          segment_ids,
+          causal=causal,
+          sm_scale=sm_scale,
+          kernel_inputs_specs=(q, k, v, ab, q_segment_ids, kv_segment_ids),
+          kernel_outputs_specs=out_shape,
       ),
   )(q, k, v, ab, q_segment_ids, kv_segment_ids)
   if save_residuals:
@@ -891,8 +949,8 @@ def _flash_attention_dkv_kernel(
 
   @pl.when(q_seq_index == q_seq_len // block_q_major - 1)
   def end_of_q_sequence():
-    dv_tile_ref[0, 0, :, :] = dv_scratch_ref[...].astype(dv_tile_ref)
-    dk_tile_ref[0, 0, :, :] = dk_scratch_ref[...].astype(dk_tile_ref)
+    dv_tile_ref[0, 0, :, :] = dv_scratch_ref[...].astype(dv_tile_ref.dtype)
+    dk_tile_ref[0, 0, :, :] = dk_scratch_ref[...].astype(dk_tile_ref.dtype)
 
 
 def _flash_attention_bwd_dkv(
@@ -952,7 +1010,7 @@ def _flash_attention_bwd_dkv(
 
     return (batch_index, head_index, next_q_index, 0)
 
-  qo_spec = pl.BlockSpec(qo_index_map, (1, 1, block_q_major, head_dim))
+  qo_spec = pl.BlockSpec((1, 1, block_q_major, head_dim), qo_index_map)
   assert qo_spec.block_shape is not None
   assert q.ndim == len(qo_spec.block_shape)
   do_spec = qo_spec
@@ -961,7 +1019,7 @@ def _flash_attention_bwd_dkv(
   def kv_index_map(batch_index, head_index, kv_seq_index, _):
     return (batch_index, head_index, kv_seq_index, 0)
 
-  kv_spec = pl.BlockSpec(kv_index_map, (1, 1, block_k_major, head_dim))
+  kv_spec = pl.BlockSpec((1, 1, block_k_major, head_dim), kv_index_map)
   assert kv_spec.block_shape is not None
   assert k.ndim == len(kv_spec.block_shape)
   assert v.ndim == len(kv_spec.block_shape)
@@ -969,12 +1027,12 @@ def _flash_attention_bwd_dkv(
   def lm_index_map(batch_index, head_index, _, q_seq_index):
     return (batch_index, head_index, q_seq_index, 0)
 
-  lm_spec = pl.BlockSpec(lm_index_map, (1, 1, block_q_major, MIN_BLOCK_SIZE))
+  lm_spec = pl.BlockSpec((1, 1, block_q_major, MIN_BLOCK_SIZE), lm_index_map)
   assert lm_spec.block_shape is not None
   assert l.ndim == len(lm_spec.block_shape)
   assert m.ndim == len(lm_spec.block_shape)
 
-  di_spec = pl.BlockSpec(qo_index_map, (1, 1, block_q_major, MIN_BLOCK_SIZE))
+  di_spec = pl.BlockSpec((1, 1, block_q_major, MIN_BLOCK_SIZE), qo_index_map)
   assert di_spec.block_shape is not None
   assert di.ndim == len(di_spec.block_shape)
 
@@ -982,7 +1040,7 @@ def _flash_attention_bwd_dkv(
     return (batch_index, head_index, q_seq_index, kv_seq_index)
 
   dab_spec = (
-      pl.BlockSpec(ab_index_map, (1, 1, block_q_major, block_k_major))
+      pl.BlockSpec((1, 1, block_q_major, block_k_major), ab_index_map)
       if ab is not None
       else None
   )
@@ -1012,10 +1070,10 @@ def _flash_attention_bwd_dkv(
       return (batch_index, 0, kv_seq_index)
 
     q_segment_ids_spec = pl.BlockSpec(
-        q_segment_ids_index_map, (1, block_q_major, NUM_LANES)
+        (1, block_q_major, NUM_LANES), q_segment_ids_index_map
     )
     kv_segment_ids_spec = pl.BlockSpec(
-        kv_segment_ids_index_map, (1, NUM_SUBLANES, block_k_major)
+        (1, NUM_SUBLANES, block_k_major), kv_segment_ids_index_map
     )
 
     q_segment_ids = jax.lax.broadcast_in_dim(
@@ -1053,23 +1111,21 @@ def _flash_attention_bwd_dkv(
                            k.dtype),
       jax.ShapeDtypeStruct((batch_size, num_heads, kv_seq_len, head_dim),
                            v.dtype),
-      jax.ShapeDtypeStruct((block_k_major, head_dim), jnp.float32),
-      jax.ShapeDtypeStruct((block_k_major, head_dim), jnp.float32),
   ]
   def dkv_index_map(batch_index, head_index, kv_seq_index, _):
     return (batch_index, head_index, kv_seq_index, 0)
 
-  dkv_spec = pl.BlockSpec(dkv_index_map, (1, 1, block_k_major, head_dim))
-  out_specs = [
-      dkv_spec, dkv_spec,
-      pl.BlockSpec(lambda *_: (0, 0), (block_k_major, head_dim)),
-      pl.BlockSpec(lambda *_: (0, 0), (block_k_major, head_dim)),
+  dkv_spec = pl.BlockSpec((1, 1, block_k_major, head_dim), dkv_index_map)
+  out_specs = [dkv_spec, dkv_spec]
+  scratch_shapes = [
+      pltpu.VMEM((block_k_major, head_dim), jnp.float32),  # type: ignore
+      pltpu.VMEM((block_k_major, head_dim), jnp.float32),  # type: ignore
   ]
 
   kernel = functools.partial(
       _flash_attention_dkv_kernel,
-      block_q=block_q,
-      block_k=block_k,
+      block_q=block_q,  # type: ignore
+      block_k=block_k,  # type: ignore
       sm_scale=sm_scale,
       causal=causal,
       mask_value=mask_value,
@@ -1077,20 +1133,24 @@ def _flash_attention_bwd_dkv(
   )
   name_scope = f"flash_mha_bwd_dkv_{block_q_major=}_{block_q=}_{block_k_major=}_{block_k=}"
   with jax.named_scope(name_scope):
-    dk, dv, _, _ = pl.pallas_call(
+    dk, dv = pl.pallas_call(
         kernel,
-        in_specs=in_specs,  # type: ignore
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            grid=grid,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            scratch_shapes=scratch_shapes,
+        ),
         out_shape=out_shapes,
-        out_specs=out_specs,
-        grid=grid,
         debug=debug,
-        mosaic_params=dict(
-            dimension_semantics=(
-                "parallel",
-                "parallel",
-                "parallel",
-                "arbitrary",
-            )
+        compiler_params=pltpu.TPUCompilerParams(
+                dimension_semantics=(
+                    "parallel",
+                    "parallel",
+                    "parallel",
+                    "arbitrary",
+                )
         ),
     )(q, k, v, ab, q_segment_ids, kv_segment_ids, l, m, do, di)
     assert dk.shape == k.shape
@@ -1110,8 +1170,8 @@ def _flash_attention_dq_kernel(
     do_tile_ref,
     di_tile_ref,
     dq_tile_ref,
-    dq_scratch_ref,
     ds_tile_ref,
+    dq_scratch_ref,
     *,
     sm_scale: float,
     causal: bool,
@@ -1243,7 +1303,7 @@ def _flash_attention_dq_kernel(
 
   @pl.when(kv_seq_index == kv_seq_len // block_k_major - 1)
   def end_of_kv_sequence():
-    dq_tile_ref[0, 0, :, :] = dq_scratch_ref[...].astype(dq_tile_ref)
+    dq_tile_ref[0, 0, :, :] = dq_scratch_ref[...].astype(dq_tile_ref.dtype)
     dq_scratch_ref[...] = jnp.zeros_like(dq_scratch_ref)
 
 
@@ -1288,7 +1348,7 @@ def _flash_attention_bwd_dq(
   def qo_index_map(batch_index, head_index, q_seq_index, _):
     return (batch_index, head_index, q_seq_index, 0)
 
-  qo_spec = pl.BlockSpec(qo_index_map, (1, 1, block_q_major, head_dim))
+  qo_spec = pl.BlockSpec((1, 1, block_q_major, head_dim), qo_index_map)
   do_spec = qo_spec
 
   def kv_index_map(batch_index, head_index, q_seq_index, kv_seq_index):
@@ -1306,7 +1366,7 @@ def _flash_attention_bwd_dq(
       next_kv_index = kv_seq_index
     return (batch_index, head_index, next_kv_index, 0)
 
-  kv_spec = pl.BlockSpec(kv_index_map, (1, 1, block_k_major, head_dim))
+  kv_spec = pl.BlockSpec((1, 1, block_k_major, head_dim), kv_index_map)
   assert kv_spec.block_shape is not None
   assert k.ndim == len(kv_spec.block_shape)
   assert v.ndim == len(kv_spec.block_shape)
@@ -1314,12 +1374,12 @@ def _flash_attention_bwd_dq(
   def lm_index_map(batch_index, head_index, q_seq_index, _):
     return (batch_index, head_index, q_seq_index, 0)
 
-  lm_spec = pl.BlockSpec(lm_index_map, (1, 1, block_q_major, MIN_BLOCK_SIZE))
+  lm_spec = pl.BlockSpec((1, 1, block_q_major, MIN_BLOCK_SIZE), lm_index_map)
   assert lm_spec.block_shape is not None
   assert l.ndim == len(lm_spec.block_shape)
   assert m.ndim == len(lm_spec.block_shape)
 
-  di_spec = pl.BlockSpec(qo_index_map, (1, 1, block_q_major, MIN_BLOCK_SIZE))
+  di_spec = pl.BlockSpec((1, 1, block_q_major, MIN_BLOCK_SIZE), qo_index_map)
   assert di_spec.block_shape is not None
   assert di.ndim == len(di_spec.block_shape)
 
@@ -1327,7 +1387,7 @@ def _flash_attention_bwd_dq(
     return (batch_index, head_index, q_seq_index, kv_seq_index)
 
   dab_spec = (
-      pl.BlockSpec(ab_index_map, (1, 1, block_q_major, block_k_major))
+      pl.BlockSpec((1, 1, block_q_major, block_k_major), ab_index_map)
       if ab is not None
       else None
   )
@@ -1359,10 +1419,10 @@ def _flash_attention_bwd_dq(
       return (batch_index, 0, next_kv_index)
 
     q_segment_ids_spec = pl.BlockSpec(
-        q_segment_ids_index_map, (1, block_q_major, NUM_LANES)
+        (1, block_q_major, NUM_LANES), q_segment_ids_index_map
     )
     kv_segment_ids_spec = pl.BlockSpec(
-        kv_segment_ids_index_map, (1, NUM_SUBLANES, block_k_major)
+        (1, NUM_SUBLANES, block_k_major), kv_segment_ids_index_map
     )
 
     q_segment_ids = jax.lax.broadcast_in_dim(
@@ -1397,40 +1457,43 @@ def _flash_attention_bwd_dq(
 
   out_shapes = [
       jax.ShapeDtypeStruct(q.shape, q.dtype),
-      jax.ShapeDtypeStruct((block_q_major, head_dim), jnp.float32),
       jax.ShapeDtypeStruct(ab.shape, ab.dtype) if ab is not None else None,
   ]
-  dq_spec = pl.BlockSpec(qo_index_map, (1, 1, block_q_major, head_dim))
+  dq_spec = pl.BlockSpec((1, 1, block_q_major, head_dim), qo_index_map)
   out_specs = [
       dq_spec,
-      pl.BlockSpec(lambda *_: (0, 0), (block_q_major, head_dim)),
       dab_spec,
   ]
+  scratch_shapes = [pltpu.VMEM((block_q_major, head_dim), jnp.float32)]  # type: ignore
 
   kernel = functools.partial(
       _flash_attention_dq_kernel,
       sm_scale=sm_scale,
       causal=causal,
       mask_value=mask_value,
-      block_k=block_k,
+      block_k=block_k,  # type: ignore
       kv_seq_len=kv_seq_len,
   )
   name_scope = f"flash_mha_bwd_dq_{block_q_major=}_{block_k_major=}_{block_k=}"
   with jax.named_scope(name_scope):
-    dq, _, ds = pl.pallas_call(
+    dq, ds = pl.pallas_call(
         kernel,
-        in_specs=in_specs,  # type: ignore
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            grid=grid,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            scratch_shapes=scratch_shapes,
+        ),
         out_shape=out_shapes,
-        out_specs=out_specs,  # type: ignore
-        grid=grid,
         debug=debug,
-        mosaic_params=dict(
-            dimension_semantics=(
-                "parallel",
-                "parallel",
-                "parallel",
-                "arbitrary",
-            )
+        compiler_params=pltpu.TPUCompilerParams(
+                dimension_semantics=(
+                    "parallel",
+                    "parallel",
+                    "parallel",
+                    "arbitrary",
+                )
         ),
     )(q, k, v, ab, q_segment_ids, kv_segment_ids, l, m, do, di)
 

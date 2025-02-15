@@ -1,4 +1,6 @@
-# GPU peformance tips
+# GPU performance tips
+
+<!--* freshness: { reviewed: '2024-06-10' } *-->
 
 This document focuses on performance tips for neural network workloads
 
@@ -23,6 +25,10 @@ code examples:
 
 ## XLA performance flags
 
+```{note}
+  JAX-Toolbox also has a page on [NVIDIA XLA performance FLAGS](https://github.com/NVIDIA/JAX-Toolbox/blob/main/rosetta/docs/GPU_performance.md).
+```
+
 The existence and exact behavior of XLA flags may be `jaxlib`-version dependent.
 
 As of `jaxlib==0.4.18` (released [Oct 6
@@ -38,11 +44,8 @@ example, we can add this to the top of a Python file:
 ```python
 import os
 os.environ['XLA_FLAGS'] = (
-    '--xla_gpu_enable_triton_softmax_fusion=true '
     '--xla_gpu_triton_gemm_any=True '
-    '--xla_gpu_enable_async_collectives=true '
     '--xla_gpu_enable_latency_hiding_scheduler=true '
-    '--xla_gpu_enable_highest_priority_async_stream=true '
 )
 ```
 
@@ -52,24 +55,31 @@ training on Nvidia GPUs](https://github.com/NVIDIA/JAX-Toolbox/blob/main/rosetta
 
 ### Code generation flags
 
-* **--xla_gpu_enable_triton_softmax_fusion** This flag enables an automatic
-  softmax fusion, based on pattern-matching backed by Triton code generation.
-  The default value is False.
 * **--xla_gpu_triton_gemm_any** Use the Triton-based GEMM (matmul) emitter for
   any GEMM that it supports. The default value is False.
 
 ### Communication flags
 
-* **--xla_gpu_enable_async_collectives** This flag enables the collective ops
-  such as `AllReduce`, `AllGather`, `ReduceScatter` and `CollectivePermute` to
-  be asynchronous. Asynchronous communication can overlap cross-core
-  communication with computation. The default value is False.
 * **--xla_gpu_enable_latency_hiding_scheduler** This flag enables latency hiding
   schedulers to overlap asynchronous communication with computation efficiently.
   The default value is False.
+* **--xla_gpu_memory_limit_slop_factor** This flag serves as a multiplier applied
+  to the total available memory, creating a threshold that guides the Latency Hiding
+  Scheduler (LHS) in balancing memory reduction and latency hiding optimizations.
+  The default value is 95.
+
+  This factor effectively establishes a memory limit for compiler passes, determining
+  when the scheduler should prioritize:
+    1. Memory reduction: When memory usage approaches or exceeds the calculated threshold.
+    2. Latency hiding: When memory usage is below the threshold, allowing for more
+       aggressive optimizations that may temporarily increase memory usage but improve
+       overall performance.
+
+  By adjusting this factor, users can fine-tune the trade-off between memory efficiency
+  and performance optimizations.
 * **--xla_gpu_enable_pipelined_collectives** When using pipeline parallelism,
   this flag enables overlapping the (i+1)-th layer weight `AllGather` with the
-  i-th layer computation. It also enables enable overlapping (i+1)-th layer
+  i-th layer computation. It also enables overlapping (i+1)-th layer
   weight `Reduce`/`ReduceScatter` with i-th layer's computation. The default
   value is False. **There are some bugs when this flag is turned on.**
 * **--xla_gpu_collective_permute_decomposer_threshold** This flag is useful when
@@ -107,3 +117,12 @@ os.environ.update({
 
 These NCCL flags could improve single-host communication speed. These flags
 don't seem useful for multi-host communication yet.
+
+## Multi-Process
+
+We recommend using one process per GPU and not one per node.  In some
+cases, this can speed up jitted computation. The
+{func}`jax.distributed.initialize` API will automatically understand
+that configuration when run under SLURM. However, this only a rule of
+thumb and it may be useful to test both one process per GPU and one
+process per node on your use case.
