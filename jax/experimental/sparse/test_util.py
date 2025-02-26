@@ -15,19 +15,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 import functools
 import itertools
 import math
-from typing import Any, Callable, Union
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 from jax import lax
 from jax import tree_util
 from jax._src import test_util as jtu
 from jax._src.lax.lax import DotDimensionNumbers
-from jax._src.lib import gpu_sparse
 from jax._src.typing import DTypeLike
 from jax.experimental import sparse
 import jax.numpy as jnp
@@ -40,10 +38,6 @@ MATMUL_TOL = {
     np.complex64: 1e-5,
     np.complex128: 1e-10,
 }
-
-GPU_LOWERING_ENABLED = gpu_sparse and (
-    gpu_sparse.cuda_is_supported or gpu_sparse.rocm_is_supported
-)
 
 
 def is_sparse(x):

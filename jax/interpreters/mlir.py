@@ -27,7 +27,7 @@ from jax._src.interpreters.mlir import (
   Token as Token,
   TokenSet as TokenSet,
   Value as Value,
-  _call_lowering as _call_lowering,
+  call_lowering as _call_lowering,  # noqa: F401
   _lowerings as _lowerings,
   _platform_specific_lowerings as _platform_specific_lowerings,
   aval_to_ir_type as aval_to_ir_type,
@@ -35,18 +35,20 @@ from jax._src.interpreters.mlir import (
   core_call_lowering as core_call_lowering,
   custom_call as custom_call,
   dense_bool_elements as dense_bool_elements,
+  dense_bool_array as dense_bool_array,
   dense_int_array as dense_int_array,
   dense_int_elements as dense_int_elements,
   dtype_to_ir_type as dtype_to_ir_type,
-  emit_python_callback as emit_python_callback,
-  flatten_lowering_ir_args as flatten_lowering_ir_args,
+  flatten_ir_types as flatten_ir_types,
+  flatten_ir_values as flatten_lowering_ir_args,  # TODO(phawkins): remove me  # noqa: F401
+  flatten_ir_values as flatten_ir_values,
+  unflatten_ir_values_like_types as unflatten_ir_values_like_types,
   func_dialect as func_dialect,
   hlo as hlo,
   i32_attr as i32_attr,
   i64_attr as i64_attr,
   ir as ir,
   ir_constant as ir_constant,
-  ir_constants as ir_constants,
   ir_type_handlers as ir_type_handlers,
   jaxpr_subcomp as jaxpr_subcomp,
   lower_fun as lower_fun,
@@ -70,4 +72,11 @@ from jax._src.sharding_impls import (
   ReplicaAxisContext as ReplicaAxisContext,
   SPMDAxisContext as SPMDAxisContext,
   ShardingContext as ShardingContext,
+)
+
+
+# TODO(dsuo): Temporarily maintain symbols related to callback lowering for sake
+# of public APIs.
+from jax._src.callback import (
+  emit_python_callback as emit_python_callback,
 )

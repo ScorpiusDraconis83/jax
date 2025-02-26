@@ -2,6 +2,10 @@ name: Wheel build - Windows CPU x86_64
 on:
   workflow_dispatch: # allows triggering the workflow run manually
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 env:
   DISTUTILS_USE_SDK: 1
   MSSdk: 1
@@ -11,21 +15,19 @@ jobs:
     strategy:
       fail-fast: false  # Don't stop all wheel builds if one has a test failure.
       matrix:
-        os: [win-2019-16core]
+        os: [windows-2019-32core]
         arch: [AMD64]
-        pyver: ['3.9', '3.10', '3.11', '3.12']
+        pyver: ['3.10', '3.11', '3.12', '3.13']
     name: ${{ matrix.os }} ${{ matrix.pyver }} jaxlib wheel build
     runs-on: ${{ matrix.os }}
 
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@01ce38bf961b4e243a6342cbade0dbc8ba3f0432 # ratchet: styfle/cancel-workflow-action@0.12.0
-        with:
-          access_token: ${{ github.token }}
+      - name: Install LLVM/Clang
+        run: choco install llvm --version=18.1.4 --yes --no-progress --allow-downgrade
 
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # ratchet:actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
-      - uses: actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c # ratchet:actions/setup-python@v5
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38  # v5.4.0
         with:
           python-version: ${{ matrix.pyver }}
           cache: 'pip'
@@ -35,13 +37,18 @@ jobs:
           BAZEL_VC: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Enterprise\\VC"
           JAXLIB_RELEASE: true
         run: |
-          python -m pip install -r build/test-requirements.txt
+          python -m pip install uv~=0.5.30
+          python -m uv pip install -r build/test-requirements.txt \
+            --upgrade numpy==2.0.0 scipy==1.13.1
           "C:\\msys64\\;C:\\msys64\\usr\\bin\\;" >> $env:GITHUB_PATH
-          python.exe build\build.py --bazel_options=--color=yes --verbose
+          python.exe build\build.py build --wheels=jaxlib `
+            --bazel_options=--color=yes `
+            --bazel_options=--config=win_clang `
+            --verbose
 
-      - uses: actions/upload-artifact@c7d193f32edcb7bfad88892161225aeda64e9392 # ratchet: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b  # v4.5.0
         with:
-          name: wheels
+          name: wheels-${{ matrix.os }}-${{ matrix.pyver }}
           path: ${{ github.workspace }}\dist\*.whl
           retention-days: 5
 
@@ -51,7 +58,7 @@ jobs:
           JAX_SKIP_SLOW_TESTS: true
           PY_COLORS: 1
         run: |
-          python -m pip install -e ${{ github.workspace }}
-          python -m pip install --no-index --find-links ${{ github.workspace }}\dist jaxlib
+          python -m uv pip install --find-links ${{ github.workspace }}\dist jaxlib \
+            -e ${{ github.workspace }}
           echo "JAX_ENABLE_CHECKS=$JAX_ENABLE_CHECKS"
           pytest -n auto --tb=short tests examples

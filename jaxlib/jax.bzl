@@ -14,12 +14,17 @@
 
 """Bazel macros used by the JAX build."""
 
+load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
 load("@com_github_google_flatbuffers//:build_defs.bzl", _flatbuffer_cc_library = "flatbuffer_cc_library")
+load("@jax_wheel//:wheel.bzl", "WHEEL_VERSION")
+load("@jax_wheel_version_suffix//:wheel_version_suffix.bzl", "BUILD_TAG", "WHEEL_VERSION_SUFFIX")
 load("@local_config_cuda//cuda:build_defs.bzl", _cuda_library = "cuda_library", _if_cuda_is_configured = "if_cuda_is_configured")
 load("@local_config_rocm//rocm:build_defs.bzl", _if_rocm_is_configured = "if_rocm_is_configured", _rocm_library = "rocm_library")
+load("@python_version_repo//:py_version.bzl", "HERMETIC_PYTHON_VERSION")
 load("@rules_cc//cc:defs.bzl", _cc_proto_library = "cc_proto_library")
-load("@tsl//tsl:tsl.bzl", _if_windows = "if_windows", _pybind_extension = "tsl_pybind_extension_opensource")
-load("@tsl//tsl/platform:build_config_root.bzl", _tf_cuda_tests_tags = "tf_cuda_tests_tags", _tf_exec_properties = "tf_exec_properties")
+load("@rules_python//python:defs.bzl", "py_test")
+load("@xla//xla/tsl:tsl.bzl", _if_windows = "if_windows", _pybind_extension = "tsl_pybind_extension_opensource")
+load("@xla//xla/tsl/platform:build_config_root.bzl", _tf_cuda_tests_tags = "tf_cuda_tests_tags", _tf_exec_properties = "tf_exec_properties")
 
 # Explicitly re-exports names to avoid "unused variable" warnings from .bzl
 # lint tools.
@@ -27,7 +32,7 @@ cc_proto_library = _cc_proto_library
 cuda_library = _cuda_library
 rocm_library = _rocm_library
 pytype_test = native.py_test
-pybind_extension = _pybind_extension
+nanobind_extension = _pybind_extension
 if_cuda_is_configured = _if_cuda_is_configured
 if_rocm_is_configured = _if_rocm_is_configured
 if_windows = _if_windows
@@ -37,22 +42,75 @@ tf_cuda_tests_tags = _tf_cuda_tests_tags
 
 jax_internal_packages = []
 jax_extend_internal_users = []
+mosaic_gpu_internal_users = []
 mosaic_internal_users = []
 pallas_gpu_internal_users = []
 pallas_tpu_internal_users = []
+pallas_extension_deps = []
 
 jax_internal_export_back_compat_test_util_visibility = []
 jax_internal_test_harnesses_visibility = []
 jax_test_util_visibility = []
 loops_visibility = []
 
+PLATFORM_TAGS_DICT = {
+    ("Linux", "x86_64"): ("manylinux2014", "x86_64"),
+    ("Linux", "aarch64"): ("manylinux2014", "aarch64"),
+    ("Linux", "ppc64le"): ("manylinux2014", "ppc64le"),
+    ("Darwin", "x86_64"): ("macosx_11_0", "x86_64"),
+    ("Darwin", "arm64"): ("macosx_11_0", "arm64"),
+    ("Windows", "AMD64"): ("win", "amd64"),
+}
+
+# TODO(vam): remove this once zstandard builds against Python 3.13
+def get_zstandard():
+    if HERMETIC_PYTHON_VERSION == "3.13":
+        return []
+    return ["@pypi_zstandard//:pkg"]
+
+_py_deps = {
+    "absl/logging": ["@pypi_absl_py//:pkg"],
+    "absl/testing": ["@pypi_absl_py//:pkg"],
+    "absl/flags": ["@pypi_absl_py//:pkg"],
+    "cloudpickle": ["@pypi_cloudpickle//:pkg"],
+    "colorama": ["@pypi_colorama//:pkg"],
+    "epath": ["@pypi_etils//:pkg"],  # etils.epath
+    "filelock": ["@pypi_filelock//:pkg"],
+    "flatbuffers": ["@pypi_flatbuffers//:pkg"],
+    "hypothesis": ["@pypi_hypothesis//:pkg"],
+    "magma": [],
+    "matplotlib": ["@pypi_matplotlib//:pkg"],
+    "mpmath": [],
+    "opt_einsum": ["@pypi_opt_einsum//:pkg"],
+    "pil": ["@pypi_pillow//:pkg"],
+    "portpicker": ["@pypi_portpicker//:pkg"],
+    "ml_dtypes": ["@pypi_ml_dtypes//:pkg"],
+    "numpy": ["@pypi_numpy//:pkg"],
+    "scipy": ["@pypi_scipy//:pkg"],
+    "tensorstore": ["@pypi_tensorstore//:pkg"],
+    "tensorflow_core": [],
+    "torch": [],
+    "zstandard": get_zstandard(),
+}
+
+def all_py_deps(excluded = []):
+    py_deps_copy = dict(_py_deps)
+    for excl in excluded:
+        py_deps_copy.pop(excl)
+    return py_deps(py_deps_copy.keys())
+
 def py_deps(_package):
     """Returns the Bazel deps for Python package `package`."""
 
-    # We assume the user has installed all dependencies in their Python environment.
-    # This indirection exists because in Google's internal build we build
-    # dependencies from source with Bazel, but that's not something most people would want.
-    return []
+    if type(_package) == type([]) or type(_package) == type(()):
+        deduped_py_deps = {}
+        for _pkg in _package:
+            for py_dep in _py_deps[_pkg]:
+                deduped_py_deps[py_dep] = _pkg
+
+        return deduped_py_deps.keys()
+
+    return _py_deps[_package]
 
 def jax_visibility(_target):
     """Returns the additional Bazel visibilities for `target`."""
@@ -61,21 +119,25 @@ def jax_visibility(_target):
     return []
 
 jax_extra_deps = []
+jax_gpu_support_deps = []
 jax2tf_deps = []
 
 def pytype_library(name, pytype_srcs = None, **kwargs):
     _ = pytype_srcs  # @unused
     native.py_library(name = name, **kwargs)
 
-def pytype_strict_library(name, pytype_srcs = None, **kwargs):
-    _ = pytype_srcs  # @unused
-    native.py_library(name = name, **kwargs)
+def pytype_strict_library(name, pytype_srcs = [], **kwargs):
+    data = pytype_srcs + (kwargs["data"] if "data" in kwargs else [])
+    new_kwargs = {k: v for k, v in kwargs.items() if k != "data"}
+    native.py_library(name = name, data = data, **new_kwargs)
 
 def py_library_providing_imports_info(*, name, lib_rule = native.py_library, pytype_srcs = [], **kwargs):
-    lib_rule(name = name, **kwargs)
+    data = pytype_srcs + (kwargs["data"] if "data" in kwargs else [])
+    new_kwargs = {k: v for k, v in kwargs.items() if k != "data"}
+    lib_rule(name = name, data = data, **new_kwargs)
 
 def py_extension(name, srcs, copts, deps, linkopts = []):
-    pybind_extension(name, srcs = srcs, copts = copts, linkopts = linkopts, deps = deps, module_name = name)
+    nanobind_extension(name, srcs = srcs, copts = copts, linkopts = linkopts, deps = deps, module_name = name)
 
 def windows_cc_shared_mlir_library(name, out, deps = [], srcs = [], exported_symbol_prefixes = []):
     """Workaround DLL building issue.
@@ -155,28 +217,56 @@ def windows_cc_shared_mlir_library(name, out, deps = [], srcs = [], exported_sym
 
 ALL_BACKENDS = ["cpu", "gpu", "tpu"]
 
-def if_building_jaxlib(if_building, if_not_building = []):
+def if_building_jaxlib(
+        if_building,
+        if_not_building = [
+            "@pypi_jaxlib//:pkg",
+            "@pypi_jax_cuda12_plugin//:pkg",
+            "@pypi_jax_cuda12_pjrt//:pkg",
+        ],
+        if_not_building_for_cpu = ["@pypi_jaxlib//:pkg"]):
+    """Adds jaxlib and jaxlib cuda plugin wheels as dependencies instead of depending on sources.
+
+    This allows us to test prebuilt versions of jaxlib wheels against the rest of the JAX codebase.
+
+    Args:
+      if_building: the source code targets to depend on in case we don't depend on the jaxlib wheels
+      if_not_building: the jaxlib wheels to depend on including gpu-specific plugins in case of
+                       gpu-enabled builds
+      if_not_building_for_cpu: the jaxlib wheels to depend on in case of cpu-only builds
+    """
+
     return select({
         "//jax:enable_jaxlib_build": if_building,
-        "//conditions:default": if_not_building,
+        "//jax_plugins/cuda:disable_jaxlib_for_cpu_build": if_not_building_for_cpu,
+        "//jax_plugins/cuda:disable_jaxlib_for_cuda12_build": if_not_building,
     })
 
 # buildifier: disable=function-docstring
-def jax_test(
+def jax_multiplatform_test(
         name,
         srcs,
         args = [],
         env = {},
         shard_count = None,
         deps = [],
-        disable_backends = None,  # buildifier: disable=unused-variable
+        data = [],
+        enable_backends = None,
         backend_variant_args = {},  # buildifier: disable=unused-variable
         backend_tags = {},  # buildifier: disable=unused-variable
         disable_configs = None,  # buildifier: disable=unused-variable
-        enable_configs = None,  # buildifier: disable=unused-variable
+        enable_configs = [],
+        config_tags_overrides = None,  # buildifier: disable=unused-variable
         tags = [],
         main = None,
         pjrt_c_api_bypass = False):  # buildifier: disable=unused-variable
+    # enable_configs and disable_configs do not do anything in OSS, only in Google's CI.
+    # The order in which `enable_backends`, `enable_configs`, and `disable_configs` are applied is
+    # as follows:
+    # 1. `enable_backends` is applied first, enabling all test configs for the given backends.
+    # 2. `disable_configs` is applied second, disabling the named test configs.
+    # 3. `enable_configs` is applied last, enabling the named test configs.
+
     if main == None:
         if len(srcs) == 1:
             main = srcs[0]
@@ -193,8 +283,8 @@ def jax_test(
             "--jax_platform_name=" + backend,
         ]
         test_tags = list(tags) + ["jax_test_%s" % backend] + backend_tags.get(backend, [])
-        if disable_backends and backend in disable_backends:
-            test_tags += ["manual"]
+        if enable_backends != None and backend not in enable_backends and not any([config.startswith(backend) for config in enable_configs]):
+            test_tags.append("manual")
         if backend == "gpu":
             test_tags += tf_cuda_tests_tags()
         native.py_test(
@@ -205,10 +295,12 @@ def jax_test(
             deps = [
                 "//jax",
                 "//jax:test_util",
-            ] + deps + if_building_jaxlib(["//jaxlib/cuda:gpu_only_test_deps"]) + select({
-                "//jax:enable_build_cuda_plugin_from_source": ["//jax_plugins:gpu_plugin_only_test_deps"],
-                "//conditions:default": [],
-            }),
+            ] + deps + if_building_jaxlib([
+                "//jaxlib/cuda:gpu_only_test_deps",
+                "//jaxlib/rocm:gpu_only_test_deps",
+                "//jax_plugins:gpu_plugin_only_test_deps",
+            ]),
+            data = data,
             shard_count = test_shards,
             tags = test_tags,
             main = main,
@@ -233,4 +325,191 @@ def jax_generate_backend_suites(backends = []):
         tags = ["-jax_test_%s" % backend for backend in backends] + ["-manual"],
     )
 
+def _get_full_wheel_name(package_name, no_abi, platform_independent, platform_name, cpu_name, wheel_version):
+    if no_abi or platform_independent:
+        wheel_name_template = "{package_name}-{wheel_version}-py{major_python_version}-none-{wheel_platform_tag}.whl"
+    else:
+        wheel_name_template = "{package_name}-{wheel_version}-cp{python_version}-cp{python_version}-{wheel_platform_tag}.whl"
+    python_version = HERMETIC_PYTHON_VERSION.replace(".", "")
+    return wheel_name_template.format(
+        package_name = package_name,
+        python_version = python_version,
+        major_python_version = python_version[0],
+        wheel_version = wheel_version,
+        wheel_platform_tag = "any" if platform_independent else "_".join(
+            PLATFORM_TAGS_DICT[platform_name, cpu_name],
+        ),
+    )
+
+def _jax_wheel_impl(ctx):
+    include_cuda_libs = ctx.attr.include_cuda_libs[BuildSettingInfo].value
+    override_include_cuda_libs = ctx.attr.override_include_cuda_libs[BuildSettingInfo].value
+    output_path = ctx.attr.output_path[BuildSettingInfo].value
+    git_hash = ctx.attr.git_hash[BuildSettingInfo].value
+    executable = ctx.executable.wheel_binary
+
+    if include_cuda_libs and not override_include_cuda_libs:
+        fail("JAX wheel shouldn't be built directly against the CUDA libraries." +
+             " Please provide `--config=cuda_libraries_from_stubs` for bazel build command." +
+             " If you absolutely need to build links directly against the CUDA libraries, provide" +
+             " `--@local_config_cuda//cuda:override_include_cuda_libs=true`.")
+
+    env = {}
+    args = ctx.actions.args()
+
+    full_wheel_version = (WHEEL_VERSION + WHEEL_VERSION_SUFFIX)
+    env["WHEEL_VERSION_SUFFIX"] = WHEEL_VERSION_SUFFIX
+    if BUILD_TAG:
+        env["WHEEL_VERSION_SUFFIX"] = ".dev{}+selfbuilt".format(BUILD_TAG)
+        full_wheel_version += env["WHEEL_VERSION_SUFFIX"]
+    if not WHEEL_VERSION_SUFFIX and not BUILD_TAG:
+        env["JAX_RELEASE"] = "1"
+
+    cpu = ctx.attr.cpu
+    no_abi = ctx.attr.no_abi
+    platform_independent = ctx.attr.platform_independent
+    platform_name = ctx.attr.platform_name
+    wheel_name = _get_full_wheel_name(
+        package_name = ctx.attr.wheel_name,
+        no_abi = no_abi,
+        platform_independent = platform_independent,
+        platform_name = platform_name,
+        cpu_name = cpu,
+        wheel_version = full_wheel_version,
+    )
+    output_file = ctx.actions.declare_file(output_path +
+                                           "/" + wheel_name)
+    wheel_dir = output_file.path[:output_file.path.rfind("/")]
+
+    args.add("--output_path", wheel_dir)  # required argument
+    if not platform_independent:
+        args.add("--cpu", cpu)
+    args.add("--jaxlib_git_hash", git_hash)  # required argument
+
+    if ctx.attr.enable_cuda:
+        args.add("--enable-cuda", "True")
+        if ctx.attr.platform_version == "":
+            fail("platform_version must be set to a valid cuda version for cuda wheels")
+        args.add("--platform_version", ctx.attr.platform_version)  # required for gpu wheels
+    if ctx.attr.enable_rocm:
+        args.add("--enable-rocm", "True")
+        if ctx.attr.platform_version == "":
+            fail("platform_version must be set to a valid rocm version for rocm wheels")
+        args.add("--platform_version", ctx.attr.platform_version)  # required for gpu wheels
+    if ctx.attr.skip_gpu_kernels:
+        args.add("--skip_gpu_kernels")
+
+    srcs = []
+    for src in ctx.attr.source_files:
+        for f in src.files.to_list():
+            srcs.append(f)
+            args.add("--srcs=%s" % (f.path))
+
+    args.set_param_file_format("flag_per_line")
+    args.use_param_file("@%s", use_always = False)
+    ctx.actions.run(
+        arguments = [args],
+        inputs = srcs,
+        outputs = [output_file],
+        executable = executable,
+        env = env,
+        mnemonic = "BuildJaxWheel",
+    )
+
+    return [DefaultInfo(files = depset(direct = [output_file]))]
+
+_jax_wheel = rule(
+    attrs = {
+        "wheel_binary": attr.label(
+            default = Label("//jaxlib/tools:build_wheel"),
+            executable = True,
+            # b/365588895 Investigate cfg = "exec" for multi platform builds
+            cfg = "target",
+        ),
+        "wheel_name": attr.string(mandatory = True),
+        "no_abi": attr.bool(default = False),
+        "platform_independent": attr.bool(default = False),
+        "cpu": attr.string(mandatory = True),
+        "platform_name": attr.string(mandatory = True),
+        "git_hash": attr.label(default = Label("//jaxlib/tools:jaxlib_git_hash")),
+        "source_files": attr.label_list(allow_files = True),
+        "output_path": attr.label(default = Label("//jaxlib/tools:output_path")),
+        "enable_cuda": attr.bool(default = False),
+        # A cuda/rocm version is required for gpu wheels; for cpu wheels, it can be an empty string.
+        "platform_version": attr.string(mandatory = True, default = ""),
+        "skip_gpu_kernels": attr.bool(default = False),
+        "enable_rocm": attr.bool(default = False),
+        "include_cuda_libs": attr.label(default = Label("@local_config_cuda//cuda:include_cuda_libs")),
+        "override_include_cuda_libs": attr.label(default = Label("@local_config_cuda//cuda:override_include_cuda_libs")),
+    },
+    implementation = _jax_wheel_impl,
+    executable = False,
+)
+
+def jax_wheel(
+        name,
+        wheel_binary,
+        wheel_name,
+        no_abi = False,
+        platform_independent = False,
+        enable_cuda = False,
+        platform_version = "",
+        source_files = []):
+    """Create jax artifact wheels.
+
+    Common artifact attributes are grouped within a single macro.
+
+    Args:
+      name: the name of the wheel
+      wheel_binary: the binary to use to build the wheel
+      wheel_name: the name of the wheel
+      no_abi: whether to build a wheel without ABI
+      platform_independent: whether to build a wheel without platform tag
+      enable_cuda: whether to build a cuda wheel
+      platform_version: the cuda version to use for the wheel
+      source_files: the source files to include in the wheel
+
+    Returns:
+      A directory containing the wheel
+    """
+    _jax_wheel(
+        name = name,
+        wheel_binary = wheel_binary,
+        wheel_name = wheel_name,
+        no_abi = no_abi,
+        platform_independent = platform_independent,
+        enable_cuda = enable_cuda,
+        platform_version = platform_version,
+        # git_hash is empty by default. Use `--//jaxlib/tools:jaxlib_git_hash=$(git rev-parse HEAD)`
+        # flag in bazel command to pass the git hash for nightly or release builds.
+        platform_name = select({
+            "@platforms//os:osx": "Darwin",
+            "@platforms//os:macos": "Darwin",
+            "@platforms//os:windows": "Windows",
+            "@platforms//os:linux": "Linux",
+        }),
+        # TODO(kanglan) Add @platforms//cpu:ppc64le once JAX Bazel is upgraded > 6.5.0.
+        cpu = select({
+            "//jaxlib/tools:macos_arm64": "arm64",
+            "//jaxlib/tools:win_amd64": "AMD64",
+            "//jaxlib/tools:arm64": "aarch64",
+            "@platforms//cpu:x86_64": "x86_64",
+        }),
+        source_files = source_files,
+    )
+
 jax_test_file_visibility = []
+
+jax_export_file_visibility = []
+
+def xla_py_proto_library(*args, **kw):  # buildifier: disable=unused-variable
+    pass
+
+def jax_py_test(
+        name,
+        env = {},
+        **kwargs):
+    env = dict(env)
+    if "PYTHONWARNINGS" not in env:
+        env["PYTHONWARNINGS"] = "error"
+    py_test(name = name, env = env, **kwargs)

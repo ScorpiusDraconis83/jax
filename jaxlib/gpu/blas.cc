@@ -13,10 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <algorithm>
+#include <cstddef>
 #include <stdexcept>
 #include <utility>
-#include <vector>
 
 #include "nanobind/nanobind.h"
 #include "nanobind/stl/pair.h"
@@ -25,7 +24,7 @@ limitations under the License.
 #include "jaxlib/gpu/blas_kernels.h"
 #include "jaxlib/gpu/vendor.h"
 #include "jaxlib/kernel_nanobind_helpers.h"
-#include "tsl/python/lib/core/numpy.h"
+#include "xla/tsl/python/lib/core/numpy.h"
 
 namespace jax {
 namespace JAX_GPU_NAMESPACE {

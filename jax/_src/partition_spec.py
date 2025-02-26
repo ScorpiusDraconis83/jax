@@ -12,16 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-class _UnconstrainedPartitionSingleton:
+from __future__ import annotations
 
-  def __str__(self):
+class UnconstrainedSingleton:
+
+  def __repr__(self):
     return "UNCONSTRAINED"
+
+  def __reduce__(self):
+    return (_get_default_unconstrained, ())
 
 
 # Unconstrained sentinel value for PartitionSpec, representing a dimension for
 # which the user wants XLA to assign the best partitioning.
 # TODO(yashkatariya): May rename to AUTO.
-_UNCONSTRAINED_PARTITION = _UnconstrainedPartitionSingleton()
+_UNCONSTRAINED_PARTITION = UnconstrainedSingleton()
+
+def _get_default_unconstrained():
+  return _UNCONSTRAINED_PARTITION
 
 
 class PartitionSpec(tuple):
@@ -48,3 +56,21 @@ class PartitionSpec(tuple):
 
   def __reduce__(self):
     return (PartitionSpec, tuple(self))
+
+  def _normalized_spec_for_aval(self, ndim: int) -> PartitionSpec:
+    out = []  # type: ignore
+    for p in self:
+      if p is None:
+        out.append(None)
+      elif p is _UNCONSTRAINED_PARTITION:
+        out.append(None)
+      elif isinstance(p, (list, tuple)):
+        if len(p) == 1:
+          out.append(p[0])
+        else:
+          out.append(tuple(p))
+      else:
+        out.append(p)
+    if len(out) < ndim:
+      out.extend([None] * (ndim - len(out)))
+    return PartitionSpec(*out)

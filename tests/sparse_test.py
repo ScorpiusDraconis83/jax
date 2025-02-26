@@ -16,14 +16,12 @@ import contextlib
 from functools import partial
 import itertools
 import math
-import unittest
 
 from absl.testing import absltest
 from absl.testing import parameterized
 
 import jax
 import jax.random
-from jax import config
 from jax import dtypes
 from jax.experimental import sparse
 from jax.experimental.sparse import coo as sparse_coo
@@ -36,7 +34,6 @@ from jax.experimental.sparse import _lowerings
 from jax._src import xla_bridge
 from jax._src.lib import gpu_sparse
 from jax import jit
-from jax import tree_util
 from jax import vmap
 from jax._src import test_util as jtu
 from jax.interpreters import mlir
@@ -45,7 +42,7 @@ from jax.util import split_list
 import numpy as np
 import scipy.sparse
 
-config.parse_flags_with_absl()
+jax.config.parse_flags_with_absl()
 
 all_dtypes = jtu.dtypes.integer + jtu.dtypes.floating + jtu.dtypes.complex
 
@@ -326,7 +323,7 @@ class cuSparseTest(sptu.SparseTestCase):
       self.assertAllClose(op(M) @ B, jit(matmat)(*args), rtol=sptu.MATMUL_TOL)
 
   def test_coo_matmat_layout(self):
-    # Regression test for https://github.com/google/jax/issues/7533
+    # Regression test for https://github.com/jax-ml/jax/issues/7533
     d = jnp.array([1.0, 2.0, 3.0, 4.0])
     i = jnp.array([0, 0, 1, 2])
     j = jnp.array([0, 2, 0, 0])
@@ -352,9 +349,6 @@ class cuSparseTest(sptu.SparseTestCase):
     mat_resorted = mat_unsorted._sort_indices()
     self.assertArraysEqual(mat.todense(), mat_resorted.todense())
 
-  @unittest.skipIf(
-      not sptu.GPU_LOWERING_ENABLED, "test requires cusparse/hipsparse"
-  )
   @jtu.run_on_devices("gpu")
   def test_coo_sorted_indices_gpu_lowerings(self):
     dtype = jnp.float32
@@ -420,7 +414,7 @@ class cuSparseTest(sptu.SparseTestCase):
   @jtu.run_on_devices("gpu")
   def test_gpu_translation_rule(self):
     version = xla_bridge.get_backend().platform_version
-    if version.split()[0] != "rocm":
+    if "rocm" not in version.split():
       cuda_version = None if version == "<unknown>" else int(
           version.split()[-1])
       if cuda_version is None or cuda_version < 11000:
@@ -545,9 +539,7 @@ class cuSparseTest(sptu.SparseTestCase):
       dtype=_lowerings.SUPPORTED_DATA_DTYPES,
       transpose=[True, False],
   )
-  @unittest.skipIf(
-      not sptu.GPU_LOWERING_ENABLED, "test requires cusparse/hipsparse"
-  )
+  @jtu.run_on_devices("gpu")
   def test_coo_spmv(self, shape, dtype, transpose):
     rng_sparse = sptu.rand_sparse(self.rng())
     rng_dense = jtu.rand_default(self.rng())
@@ -570,9 +562,7 @@ class cuSparseTest(sptu.SparseTestCase):
       dtype=_lowerings.SUPPORTED_DATA_DTYPES,
       transpose=[True, False],
   )
-  @unittest.skipIf(
-      not sptu.GPU_LOWERING_ENABLED, "test requires cusparse/hipsparse"
-  )
+  @jtu.run_on_devices("gpu")
   def test_coo_spmm(self, shape, dtype, transpose):
     rng_sparse = sptu.rand_sparse(self.rng())
     rng_dense = jtu.rand_default(self.rng())
@@ -595,9 +585,7 @@ class cuSparseTest(sptu.SparseTestCase):
       dtype=_lowerings.SUPPORTED_DATA_DTYPES,
       transpose=[True, False],
   )
-  @unittest.skipIf(
-      not sptu.GPU_LOWERING_ENABLED, "test requires cusparse/hipsparse"
-  )
+  @jtu.run_on_devices("gpu")
   def test_csr_spmv(self, shape, dtype, transpose):
     rng_sparse = sptu.rand_sparse(self.rng())
     rng_dense = jtu.rand_default(self.rng())
@@ -618,9 +606,7 @@ class cuSparseTest(sptu.SparseTestCase):
       dtype=_lowerings.SUPPORTED_DATA_DTYPES,
       transpose=[True, False],
   )
-  @unittest.skipIf(
-      not sptu.GPU_LOWERING_ENABLED, "test requires cusparse/hipsparse"
-  )
+  @jtu.run_on_devices("gpu")
   def test_csr_spmm(self, shape, dtype, transpose):
     rng_sparse = sptu.rand_sparse(self.rng())
     rng_dense = jtu.rand_default(self.rng())
@@ -726,6 +712,97 @@ class SparseGradTest(sptu.SparseTestCase):
       self.assertAllClose(jac_dense(f, argnums=1, has_aux=has_aux)(X, y),
                           jac_sparse(f, argnums=1, has_aux=has_aux)(Xsp, y), rtol=rtol)
 
+  @jtu.sample_product(has_aux=[True, False],
+                      deep=[True,False],
+                      arg0=[True,False],
+                      bias=[True,False])
+  def test_sparse_pytree_grad(self, has_aux, deep, arg0, bias):
+    rng_sparse = sptu.rand_sparse(self.rng())
+    rng = jtu.rand_default(self.rng())
+
+    y = rng(5, "float32")
+    X = rng_sparse((10, 5), "float32")
+    b = rng(10, "float32")
+    Xsp = sparse.BCOO.fromdense(X)
+    Xtree_sp = {'deep':{'X':Xsp},
+                'X':Xsp,
+                'list':[None,(b,None)]}
+    Xtree_de = {'deep':{'X':X},
+                'X':X,
+                'list':[None,(b,None)]}
+
+    def f(Xtree, y):
+      if deep:
+        out = Xtree['deep']['X'] @ y
+      else:
+        out = Xtree['X'] @ y
+      # Other grad variables
+      if bias:
+        out += Xtree['list'][1][0]
+      out = jnp.sum(out)
+      if has_aux:
+        return out, {'y': y.shape}
+      else:
+        return out
+
+    def g(y, Xtree):
+      if deep:
+        out = Xtree['deep']['X'] @ y
+      else:
+        out = Xtree['X'] @ y
+      # Other grad variables
+      if bias:
+        out += Xtree['list'][1][0]
+      out = jnp.sum(out)
+      if has_aux:
+        return out, {'y': y.shape}
+      return out
+
+    with self.subTest("wrt sparse"):
+      # Argument ordering
+      if arg0:
+        grad_de = jax.grad(f, argnums=0, has_aux=has_aux)(Xtree_de, y)
+        grad_sp = sparse.grad(f, argnums=0, has_aux=has_aux)(Xtree_sp, y)
+      else:
+        grad_de = jax.grad(g, argnums=1, has_aux=has_aux)(y, Xtree_de)
+        grad_sp = sparse.grad(g, argnums=1, has_aux=has_aux)(y, Xtree_sp)
+
+      if has_aux:
+        grad_de, aux_de = grad_de
+        grad_sp, aux_sp = grad_sp
+        self.assertAllClose(aux_de, aux_sp)
+
+      # Pytree structure
+      is_bcoo = lambda x: isinstance(x, sparse.bcoo.BCOO)
+      grad_densified = jax.tree_util.tree_map(sparse.todense, grad_sp,
+                                              is_leaf=is_bcoo)
+      self.assertEqual(jax.tree_util.tree_structure(grad_de),
+                       jax.tree_util.tree_structure(grad_densified))
+
+      # Depth in tree
+      if deep:
+        grad_sp_arr = grad_sp['deep']['X']
+        grad_de_arr = grad_de['deep']['X']
+      else:
+        grad_sp_arr = grad_sp['X']
+        grad_de_arr = grad_de['X']
+      self.assertIsInstance(grad_sp_arr, sparse.BCOO)
+      self.assertAllClose(grad_sp_arr.data,
+                          sparse_bcoo._bcoo_extract(grad_sp_arr.indices,
+                                                    grad_de_arr))
+      # Other grad variables
+      if bias:
+        self.assertAllClose(grad_sp['list'][1][0],
+                            grad_de['list'][1][0])
+
+    with self.subTest("wrt dense"):
+      # Argument ordering
+      if arg0:
+        self.assertAllClose(jax.grad(f, argnums=1, has_aux=has_aux)(Xtree_de, y),
+                            sparse.grad(f, argnums=1, has_aux=has_aux)(Xtree_sp, y))
+      else:
+        self.assertAllClose(jax.grad(g, argnums=0, has_aux=has_aux)(y, Xtree_de),
+                            sparse.grad(g, argnums=0, has_aux=has_aux)(y, Xtree_sp))
 
 class SparseObjectTest(sptu.SparseTestCase):
   @parameterized.named_parameters(
@@ -735,9 +812,9 @@ class SparseObjectTest(sptu.SparseTestCase):
     sparse_format = cls.__name__.lower()
     M = sparse.empty((2, 4), sparse_format=sparse_format)
     self.assertIsInstance(M, cls)
-    buffers, tree = tree_util.tree_flatten(M)
+    buffers, tree = jax.tree.flatten(M)
     self.assertTrue(all(isinstance(buffer, jax.Array) for buffer in buffers))
-    M_out = tree_util.tree_unflatten(tree, buffers)
+    M_out = jax.tree.unflatten(tree, buffers)
     self.assertEqual(M.dtype, M_out.dtype)
     self.assertEqual(M.shape, M_out.shape)
     self.assertEqual(M.nse, M_out.nse)
@@ -877,7 +954,7 @@ class SparseObjectTest(sptu.SparseTestCase):
   def test_todense_ad(self, Obj, shape=(3,), dtype=np.float32):
     M_dense = jnp.array([1., 2., 3.])
     M = M_dense if Obj is jnp.array else Obj.fromdense(M_dense)
-    bufs, tree = tree_util.tree_flatten(M)
+    bufs, tree = jax.tree.flatten(M)
     jac = jnp.eye(M.shape[0], dtype=M.dtype)
     jac1 = jax.jacfwd(lambda *bufs: sparse.todense_p.bind(*bufs, tree=tree))(*bufs)
     jac2 = jax.jacrev(lambda *bufs: sparse.todense_p.bind(*bufs, tree=tree))(*bufs)
@@ -1084,8 +1161,6 @@ class SparseSolverTest(sptu.SparseTestCase):
   )
   @jtu.run_on_devices("cpu", "cuda")
   def test_sparse_qr_linear_solver(self, size, reorder, dtype):
-    if jtu.test_device_matches(["cuda"]) and not sptu.GPU_LOWERING_ENABLED:
-      raise unittest.SkipTest('test requires cusparse/cusolver')
     rng = sptu.rand_sparse(self.rng())
     a = rng((size, size), dtype)
     nse = (a != 0).sum()
@@ -1111,8 +1186,6 @@ class SparseSolverTest(sptu.SparseTestCase):
   )
   @jtu.run_on_devices("cpu", "cuda")
   def test_sparse_qr_linear_solver_grads(self, size, dtype):
-    if jtu.test_device_matches(["cuda"]) and not sptu.GPU_LOWERING_ENABLED:
-      raise unittest.SkipTest('test requires cusparse/cusolver')
     rng = sptu.rand_sparse(self.rng())
     a = rng((size, size), dtype)
     nse = (a != 0).sum()

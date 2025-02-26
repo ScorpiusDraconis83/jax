@@ -14,17 +14,15 @@
 
 import os
 import platform
-import time
-import warnings
 
 from absl import logging
 from absl.testing import absltest
 
+from jax import version
 from jax._src import compiler
 from jax._src import config
 from jax._src import test_util as jtu
 from jax._src import xla_bridge as xb
-from jax._src.interpreters import xla
 from jax._src.lib import xla_client as xc
 
 config.parse_flags_with_absl()
@@ -55,8 +53,7 @@ class XlaBridgeTest(jtu.JaxTestCase):
         num_replicas=1, num_partitions=1, fdo_profile=b"test_profile"
     )
     self.assertEqual(
-        compile_options.executable_build_options.fdo_profile, "test_profile"
-    )
+        compile_options.executable_build_options.fdo_profile, b"test_profile")
 
   def test_autofdo_profile(self):
 
@@ -120,47 +117,12 @@ class XlaBridgeTest(jtu.JaxTestCase):
     # Map order does not matter.
     self.assertEqual(c1str, c2.SerializeAsString())
 
-  def test_parameter_replication_default(self):
-    c = xc.XlaBuilder("test")
-    _ = xla.parameter(c, 0, xc.Shape.array_shape(xc.PrimitiveType.F32, ()))
-    built_c = c.Build()
-    assert "replication" not in built_c.as_hlo_text()
-
-  def test_parameter_replication(self):
-    c = xc.XlaBuilder("test")
-    _ = xla.parameter(c, 0, xc.Shape.array_shape(xc.PrimitiveType.F32, ()), "",
-                     False)
-    built_c = c.Build()
-    assert "parameter_replication={false}" in built_c.as_hlo_text()
-
   def test_local_devices(self):
     self.assertNotEmpty(xb.local_devices())
     with self.assertRaisesRegex(ValueError, "Unknown process_index 100"):
       xb.local_devices(100)
     with self.assertRaisesRegex(RuntimeError, "Unknown backend foo"):
       xb.local_devices(backend="foo")
-
-  def test_timer_tpu_warning(self):
-    with warnings.catch_warnings(record=True) as w:
-      warnings.simplefilter("always")
-
-      def _mock_tpu_client(library_path=None):
-        time_to_wait = 5
-        start = time.time()
-        while not w:
-          if time.time() - start > time_to_wait:
-            raise ValueError(
-                "This test should not hang for more than "
-                f"{time_to_wait} seconds.")
-          time.sleep(0.1)
-
-        self.assertLen(w, 1)
-        msg = str(w[-1].message)
-        self.assertIn("Did you run your code on all TPU hosts?", msg)
-
-      with mock.patch.object(xc, "make_tpu_client",
-                             side_effect=_mock_tpu_client):
-        xb.tpu_client_timer_callback(0.01)
 
   def test_register_plugin(self):
     with self.assertLogs(level="WARNING") as log_output:
@@ -194,7 +156,12 @@ class XlaBridgeTest(jtu.JaxTestCase):
     self.assertIn("name2", xb._backend_factories)
     self.assertEqual(registration.priority, 400)
     self.assertTrue(registration.experimental)
-    mock_make.assert_called_once_with("name1", None, None)
+
+    options = {}
+    if xb.get_backend().platform == 'tpu':
+      options["ml_framework_name"] = "JAX"
+      options["ml_framework_version"] = version.__version__
+    mock_make.assert_called_once_with("name1", options, None)
 
   def test_register_plugin_with_config(self):
     test_json_file_path = os.path.join(
@@ -221,16 +188,19 @@ class XlaBridgeTest(jtu.JaxTestCase):
     self.assertIn("name1", xb._backend_factories)
     self.assertEqual(registration.priority, 400)
     self.assertTrue(registration.experimental)
-    mock_make.assert_called_once_with(
-        "name1",
-        {
-            "int_option": 64,
-            "int_list_option": [32, 64],
-            "string_option": "string",
-            "float_option": 1.0,
-        },
-        None,
-    )
+
+    # The expectation is specified in example_pjrt_plugin_config.json.
+    options = {
+        "int_option": 64,
+        "int_list_option": [32, 64],
+        "string_option": "string",
+        "float_option": 1.0,
+        }
+    if xb.get_backend().platform == 'tpu':
+      options["ml_framework_name"] = "JAX"
+      options["ml_framework_version"] = version.__version__
+
+    mock_make.assert_called_once_with("name1", options, None)
 
 
 class GetBackendTest(jtu.JaxTestCase):
@@ -247,8 +217,14 @@ class GetBackendTest(jtu.JaxTestCase):
     def process_index(self):
       return 0
 
+    def devices(self):
+      return []
+
     def local_devices(self):
       return []
+
+    def _get_all_devices(self):
+      return self.devices()
 
   def _register_factory(self, platform: str, priority, device_count=1,
                         assert_used_at_most_once=False, experimental=False):
@@ -336,7 +312,6 @@ class GetBackendTest(jtu.JaxTestCase):
     ):
       xb.get_backend("error")
 
-
   def test_no_devices(self):
     self._register_factory("no_devices", -10, device_count=0)
     with self.assertRaisesRegex(
@@ -384,7 +359,6 @@ class GetBackendTest(jtu.JaxTestCase):
       "not all JAX functionality may be correctly supported!",
       logs.output
     )
-
 
 
 if __name__ == "__main__":

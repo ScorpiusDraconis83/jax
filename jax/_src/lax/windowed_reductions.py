@@ -14,55 +14,64 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import partial
-from typing import Callable
 import warnings
 
-import numpy as np
-
 from jax import tree_util
-
-from jax._src import ad_util
+from jax._src import api_util
 from jax._src import core
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import util
-from jax._src.core import ShapedArray, ConcreteArray
+from jax._src.core import ShapedArray
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
-from jax._src.lax import lax
 from jax._src.lax import convolution
+from jax._src.lax import lax
 from jax._src.lax import slicing
+from jax._src.lax.other import logaddexp
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
-from jax._src.numpy.ufuncs import logaddexp
 from jax._src.typing import Array
+import numpy as np
+from jax._src.core import ClosedJaxpr
+from jax._src.core import jaxpr_as_fun
+from jax._src.interpreters.ad import jvp_jaxpr
+from jax._src import ad_util
 
 map = util.safe_map
 zip = util.safe_zip
 
 
-def reduce_window(operand, init_value, computation: Callable,
-                  window_dimensions: core.Shape, window_strides: Sequence[int],
-                  padding: str | Sequence[tuple[int, int]],
-                  base_dilation: Sequence[int] | None = None,
-                  window_dilation: Sequence[int] | None = None) -> Array:
-  """Wraps XLA's `ReduceWindowWithGeneralPadding
-  <https://www.tensorflow.org/xla/operation_semantics#reducewindow>`_
-  operator.
-  """
+def _reduce_window(
+    operand,
+    init_value,
+    computation,
+    window_dimensions: core.Shape,
+    window_strides: Sequence[int],
+    padding: str | Sequence[tuple[int, int]],
+    base_dilation: Sequence[int] | None = None,
+    window_dilation: Sequence[int] | None = None,
+):
   flat_operands, operand_tree = tree_util.tree_flatten(operand)
+  comp_debug = api_util.debug_info("reduce_window comp", computation,
+                                   (init_value, init_value), {})
   flat_init_values, init_value_tree = tree_util.tree_flatten(init_value)
   if operand_tree != init_value_tree:
-    raise ValueError('Operands must have the same tree structure as '
-                     f'init_values: {operand_tree} vs. {init_value_tree}')
-  if len(flat_operands) == 0:
-    raise ValueError('reduce_window must have at least one operand.')
+    raise ValueError(
+        "Operands must have the same tree structure as "
+        f"init_values: {operand_tree} vs. {init_value_tree}"
+    )
   if len(flat_operands) != len(flat_init_values):
-    raise ValueError('Must have same total number of operands as init_values: '
-                     f' {len(flat_operands)} vs. {len(flat_init_values)}')
+    raise ValueError(
+        "Must have same total number of operands as init_values: "
+        f" {len(flat_operands)} vs. {len(flat_init_values)}"
+    )
+
+  if len(flat_operands) == 0:
+    raise ValueError("reduce_window must have at least one operand.")
   if isinstance(padding, str):
     dilated_window_dims = (
         window_dimensions if window_dilation is None else
@@ -80,37 +89,73 @@ def reduce_window(operand, init_value, computation: Callable,
     return monoid_reducer(operand, window_dimensions, window_strides, padding,
                           base_dilation, window_dilation)
   else:
-    flat_init_avals = map(lax._abstractify, flat_init_values)
+    flat_init_avals = map(core.get_aval, flat_init_values)
     jaxpr, out_tree = lax._variadic_reduction_jaxpr(
-        computation, tuple(flat_init_avals), init_value_tree)
+        computation, comp_debug, tuple(flat_init_avals), init_value_tree
+    )
     if operand_tree != out_tree:
       raise ValueError(
         'reduce_window output must have the same tree structure as the operands'
         f' {operand_tree} vs. {out_tree}')
     out_flat = reduce_window_p.bind(
-        *flat_operands, *flat_init_values, jaxpr=jaxpr.jaxpr,
-        consts=tuple(jaxpr.consts), window_dimensions=tuple(window_dimensions),
-        window_strides=tuple(window_strides), padding=padding,
+        *flat_operands,
+        *flat_init_values,
+        jaxpr=jaxpr.jaxpr,
+        consts=tuple(jaxpr.consts),
+        window_dimensions=tuple(window_dimensions),
+        window_strides=tuple(window_strides),
+        padding=padding,
         base_dilation=tuple(base_dilation),
-        window_dilation=tuple(window_dilation))
+        window_dilation=tuple(window_dilation),
+    )
     return tree_util.tree_unflatten(out_tree, out_flat)
 
-def _get_monoid_window_reducer(monoid_op: Callable,
-                               xs: Sequence[Array]) -> Callable | None:
+
+def reduce_window(
+    operand,
+    init_value,
+    computation: Callable,
+    window_dimensions: core.Shape,
+    window_strides: Sequence[int],
+    padding: str | Sequence[tuple[int, int]],
+    base_dilation: Sequence[int] | None = None,
+    window_dilation: Sequence[int] | None = None,
+) -> Array:
+  """Wraps XLA's `ReduceWindowWithGeneralPadding
+  <https://www.tensorflow.org/xla/operation_semantics#reducewindow>`_
+  operator.
+  """
+  return _reduce_window(
+      operand,
+      init_value,
+      computation,
+      window_dimensions,
+      window_strides,
+      padding,
+      base_dilation,
+      window_dilation,
+  )
+
+
+def _get_monoid_window_reducer(
+    monoid_op, xs: Sequence[Array]
+) -> Callable | None:
   if len(xs) != 1:
     return None
   x, = xs
   aval = core.get_aval(x)
-  if (type(aval) is ConcreteArray) and aval.shape == ():
+  if core.is_concrete(x) and aval.shape == ():
+    val = core.to_concrete_value(x)
     if monoid_op is lax.add:
-      return aval.val == 0 and _reduce_window_sum
+      return val == 0 and _reduce_window_sum
     elif monoid_op is lax.max:
-      return (aval.val == lax._get_max_identity(aval.dtype)
+      return (val == lax._get_max_identity(aval.dtype)
               and _reduce_window_max)
     elif monoid_op is lax.min:
-      return (aval.val == lax._get_min_identity(aval.dtype)
+      return (val == lax._get_min_identity(aval.dtype)
               and _reduce_window_min)
   return None
+
 
 def _reduce_window_sum(operand: Array, window_dimensions: core.Shape,
                        window_strides: Sequence[int],
@@ -133,7 +178,7 @@ def _reduce_window_prod(operand: Array, window_dimensions: core.Shape,
                         base_dilation: Sequence[int] | None = None,
                         window_dilation: Sequence[int] | None = None) -> Array:
   init_value = lax._const(operand, 1)
-  jaxpr, consts = lax._reduction_jaxpr(lax.mul, lax._abstractify(init_value))
+  jaxpr, consts = lax._reduction_jaxpr(lax.mul, core.get_aval(init_value))
   if base_dilation is None:
     base_dilation = (1,) * len(window_dimensions)
   if window_dilation is None:
@@ -183,7 +228,7 @@ def _reduce_window_logaddexp(
     base_dilation: Sequence[int] | None = None,
     window_dilation: Sequence[int] | None = None) -> Array:
   init_value = lax._const(operand, -np.inf)
-  jaxpr, consts = lax._reduction_jaxpr(logaddexp, lax._abstractify(init_value))
+  jaxpr, consts = lax._reduction_jaxpr(logaddexp, core.get_aval(init_value))
   if base_dilation is None:
     base_dilation = (1,) * len(window_dimensions)
   if window_dilation is None:
@@ -202,9 +247,9 @@ def _select_and_scatter(operand: Array, select: Callable,
                         padding: Sequence[tuple[int, int]], source: Array,
                         init_value: Array, scatter: Callable) -> Array:
   select_jaxpr, select_consts = lax._reduction_jaxpr(
-    select, lax._abstractify(init_value))
+    select, core.get_aval(init_value))
   scatter_jaxpr, scatter_consts = lax._reduction_jaxpr(
-    scatter, lax._abstractify(init_value))
+    scatter, core.get_aval(init_value))
   return select_and_scatter_p.bind(
       operand, source, init_value, select_jaxpr=select_jaxpr,
       select_consts=select_consts, scatter_jaxpr=scatter_jaxpr,
@@ -260,10 +305,19 @@ def _select_and_gather_add(tangents: Array, operand: Array,
 
 
 def _reduce_window_abstract_eval_rule(
-    *avals, jaxpr, consts, window_dimensions, window_strides, padding,
-    base_dilation, window_dilation):
+    *avals,
+    jaxpr,
+    consts,
+    window_dimensions,
+    window_strides,
+    padding,
+    base_dilation,
+    window_dilation,
+):
   operand_avals, init_val_avals = util.split_list(avals, [len(avals) // 2])
-  if any(o.dtype != iv.dtype for o, iv in zip(operand_avals, init_val_avals)):
+  if any(
+      o.dtype != iv.dtype for o, iv in zip(operand_avals, init_val_avals)
+  ):
     msg = ("reduce_window got inconsistent dtypes for operands and init_values:"
            " got operand dtypes {} and init_value dtypes {}.")
     raise TypeError(msg.format([o.dtype for o in operand_avals],
@@ -273,13 +327,27 @@ def _reduce_window_abstract_eval_rule(
            "have shapes {}.")
     raise TypeError(msg.format([v.shape for v in init_val_avals]))
   out_shape = _common_reduce_window_shape_rule(
-    operand_avals[0], window_dimensions, window_strides, padding,
-    base_dilation, window_dilation)
-  return tuple(ShapedArray(out_shape, op.dtype) for op in operand_avals)
+      operand_avals[0], window_dimensions, window_strides, padding,
+      base_dilation, window_dilation)
+  out_sharding = reduce_window_sharding_rule(
+      operand_avals[0], window_dimensions, window_strides, padding,
+      base_dilation, window_dilation)
+  return tuple(ShapedArray(out_shape, op.dtype, sharding=out_sharding)
+               for op in operand_avals)
+
 
 def _generic_reduce_window_batch_rule(
-    batched_args, batch_dims, *, jaxpr, consts, window_dimensions,
-    window_strides, padding, base_dilation, window_dilation):
+    batched_args,
+    batch_dims,
+    *,
+    jaxpr,
+    consts,
+    window_dimensions,
+    window_strides,
+    padding,
+    base_dilation,
+    window_dilation,
+):
   num_operands = len(batched_args) // 2
   operands, init_values = util.split_list(batched_args, [num_operands])
   operand_bdims, init_value_bdims = util.split_list(batch_dims, [num_operands])
@@ -306,35 +374,93 @@ def _generic_reduce_window_batch_rule(
 
 
 reduce_window_p = core.Primitive('reduce_window')
+
+
+def reduce_window_jvp(
+    primals,
+    tangents,
+    window_dimensions,
+    window_strides,
+    padding,
+    base_dilation,
+    window_dilation,
+    jaxpr,
+    consts,
+):
+
+  reduction_jaxpr = jaxpr
+
+  n = len(primals) // 2  # number of primal operands
+  operand, init_value = util.split_list(primals, [n])
+  operand_tangent, init_value_tangent = util.split_list(tangents, [n])
+  if not all(isinstance(t, ad.Zero) for t in init_value_tangent):
+    raise TypeError("reduce_window jvp does not support non-zero init_value_tangent.")
+
+  init_value_tangent = map(ad_util.instantiate, init_value_tangent)
+  c_reduction_jaxpr = ClosedJaxpr(reduction_jaxpr, consts)
+  jvp_reduction = jvp_jaxpr(c_reduction_jaxpr, (True,) * len(tangents), [False] * len(init_value_tangent))[0]
+
+  def wrapper(left, right):
+    pl, tl = util.split_list(left, [n])
+    pr, tr = util.split_list(right, [n])
+    return jaxpr_as_fun(jvp_reduction)(*pl, *pr, *tl, *tr)
+
+  jvp_primals_tangents = _reduce_window(
+      operand=[*operand, *operand_tangent],
+      init_value=[*init_value, *init_value_tangent],
+      computation=wrapper,
+      window_dimensions=window_dimensions,
+      window_strides=window_strides,
+      padding=padding,
+      base_dilation=base_dilation,
+      window_dilation=window_dilation,
+  )
+  primals, tangents = util.split_list(jvp_primals_tangents, [len(jvp_primals_tangents) // 2])
+  return [*primals], [*tangents]
+
+ad.primitive_jvps[reduce_window_p] = reduce_window_jvp
 reduce_window_p.multiple_results = True
 reduce_window_p.def_impl(partial(dispatch.apply_primitive, reduce_window_p))
 reduce_window_p.def_abstract_eval(_reduce_window_abstract_eval_rule)
 batching.primitive_batchers[reduce_window_p] = _generic_reduce_window_batch_rule
 
-def _generic_reduce_window_lower(ctx, *args, jaxpr, consts,
-                                 window_dimensions, window_strides, padding,
-                                 base_dilation, window_dilation):
+
+def _generic_reduce_window_lower(
+    ctx,
+    *args,
+    jaxpr,
+    consts,
+    window_dimensions,
+    window_strides,
+    padding,
+    base_dilation,
+    window_dilation,
+):
   operands, init_values = util.split_list(args, [len(args) // 2])
   _, init_value_avals = util.split_list(ctx.avals_in, [len(operands)])
 
   def reducer_body(reducer: ir.Block) -> Sequence[ir.Value]:
     if jaxpr.effects:
       raise NotImplementedError('Cannot lower effectful `reduce_window`.')
-    out_nodes, _ = mlir.jaxpr_subcomp(ctx.module_context, jaxpr,
-        mlir.TokenSet(), consts, *([a] for a in reducer.arguments),
+    out_nodes, _ = mlir.jaxpr_subcomp(ctx.module_context, jaxpr, ctx.name_stack,
+        mlir.TokenSet(), consts, *reducer.arguments,  # type: ignore[misc]
         dim_var_values=ctx.dim_var_values)
-    return util.flatten(out_nodes)
+    return mlir.flatten_ir_values(out_nodes)
 
   return mlir.reduce_window(
       ctx,
       reducer_name="generic_reduce_window_reducer",
       reducer_body=reducer_body,
       operands=operands,
-      init_values=init_values, init_values_avals=init_value_avals,
+      init_values=init_values,
+      init_values_avals=init_value_avals,
       out_avals=ctx.avals_out,
-      window_dimensions=window_dimensions, window_strides=window_strides,
-      base_dilation=base_dilation, window_dilation=window_dilation,
-      padding=padding)
+      window_dimensions=window_dimensions,
+      window_strides=window_strides,
+      base_dilation=base_dilation,
+      window_dilation=window_dilation,
+      padding=padding,
+  )
 
 
 mlir.register_lowering(reduce_window_p, _generic_reduce_window_lower)
@@ -386,8 +512,27 @@ def _reduce_window_batch_rule(reduce_window, batched_args, bdims, *,
                           base_dilation, window_dilation)
   return operand, bdim
 
+def reduce_window_sharding_rule(operand, window_dimensions, window_strides,
+                                padding, base_dilation, window_dilation):
+  if base_dilation is None:
+    base_dilation = [1] * operand.ndim
+  if window_dilation is None:
+    window_dilation = [1] * operand.ndim
+
+  for spec, wdim, ws, pd, bd, wdil in zip(
+      operand.sharding.spec, window_dimensions, window_strides, padding,
+      base_dilation, window_dilation):
+    if spec is None:
+      continue
+    if not (wdim == 1 and ws == 1 and pd == 1 and bd == 1 and wdil == 1):
+      raise NotImplementedError(
+          "Only trivial windowing is supported along non-replicated"
+          f" dimensions. Got {operand.sharding.spec=}")
+  return operand.sharding
+
 reduce_window_sum_p = lax.standard_primitive(
-    _reduce_window_sum_shape_rule, lax._input_dtype, 'reduce_window_sum')
+    _reduce_window_sum_shape_rule, lax._input_dtype, 'reduce_window_sum',
+    sharding_rule=reduce_window_sharding_rule)
 ad.deflinear2(reduce_window_sum_p, _reduce_window_sum_transpose_rule)
 batching.primitive_batchers[reduce_window_sum_p] = partial(
   _reduce_window_batch_rule, _reduce_window_sum)
@@ -402,9 +547,14 @@ def _reduce_window_chooser_jvp_rule(prim, g, operand, *, window_dimensions,
                                 window_dilation)
 
 
-def _common_reduce_window_shape_rule(operand, window_dimensions,
-                                     window_strides, padding, base_dilation,
-                                     window_dilation):
+def _common_reduce_window_shape_rule(
+    operand,
+    window_dimensions,
+    window_strides,
+    padding,
+    base_dilation,
+    window_dilation,
+):
   lax._check_shapelike("reduce_window", "window_dimensions", window_dimensions,
                        non_zero_shape=True)
   lax._check_shapelike("reduce_window", "window_strides", window_strides,
@@ -412,8 +562,10 @@ def _common_reduce_window_shape_rule(operand, window_dimensions,
   lax._check_shapelike("reduce_window", "base_dilation", base_dilation)
   lax._check_shapelike("reduce_window", "window_dilation", window_dilation)
   if operand.ndim != len(window_dimensions):
-    msg = ("reduce_window got the wrong number of window_dimensions for "
-           "operand: got operand shape {} with window_dimensions {}.")
+    msg = (
+        "reduce_window got the wrong number of window_dimensions for "
+        "operand: got operand shape {} with window_dimensions {}."
+    )
     raise TypeError(msg.format(operand.shape, window_dimensions))
   if len(window_strides) != len(window_dimensions):
     msg = ("reduce_window got inconsistent window_strides and "
@@ -443,15 +595,18 @@ def reduce_window_shape_tuple(operand_shape, window_dimensions, window_strides,
   operand_padded = tuple(d + pl + ph for d, (pl, ph) in zip(operand_shape, padding))
   return tuple(map(core.stride_dim, operand_padded, window_dimensions, window_strides))
 
+
 reduce_window_max_p = lax.standard_primitive(
-    _common_reduce_window_shape_rule, lax._input_dtype, 'reduce_window_max')
+    _common_reduce_window_shape_rule, lax._input_dtype, 'reduce_window_max',
+    sharding_rule=reduce_window_sharding_rule)
 ad.defjvp(reduce_window_max_p, partial(_reduce_window_chooser_jvp_rule,
                                        lax.max_p))
 batching.primitive_batchers[reduce_window_max_p] = partial(
   _reduce_window_batch_rule, _reduce_window_max)
 
 reduce_window_min_p = lax.standard_primitive(
-    _common_reduce_window_shape_rule, lax._input_dtype, 'reduce_window_min')
+    _common_reduce_window_shape_rule, lax._input_dtype, 'reduce_window_min',
+    sharding_rule=reduce_window_sharding_rule)
 ad.defjvp(reduce_window_min_p, partial(_reduce_window_chooser_jvp_rule,
                                        lax.min_p))
 
@@ -463,24 +618,36 @@ batching.primitive_batchers[reduce_window_min_p] = partial(
 
 def _reduce_window_lower(
     reduce_op,
-    init_value, ctx, operand, *,
-    window_dimensions, window_strides, padding, base_dilation,
-    window_dilation):
+    init_value,
+    ctx,
+    operand,
+    *,
+    window_dimensions,
+    window_strides,
+    padding,
+    base_dilation,
+    window_dilation,
+):
 
   operand_aval, = ctx.avals_in
   scalar_aval = operand_aval.update(shape=())
 
-  return mlir.reduce_window(ctx,
+  return mlir.reduce_window(
+      ctx,
       reducer_name=f"reduce_window_{scalar_aval.dtype}_reducer",
       reducer_body=lambda reducer: [reduce_op(*reducer.arguments)],
       operands=[operand],
-      init_values=[mlir.full_like_aval(ctx, init_value(scalar_aval.dtype),
-                                       scalar_aval)],
+      init_values=[
+          mlir.full_like_aval(ctx, init_value(scalar_aval.dtype), scalar_aval)
+      ],
       init_values_avals=[scalar_aval],
       out_avals=ctx.avals_out,
       window_dimensions=window_dimensions,
-      window_strides=window_strides, base_dilation=base_dilation,
-      window_dilation=window_dilation, padding=padding)
+      window_strides=window_strides,
+      base_dilation=base_dilation,
+      window_dilation=window_dilation,
+      padding=padding,
+  )
 
 
 mlir.register_lowering(reduce_window_sum_p, partial(
@@ -489,7 +656,6 @@ mlir.register_lowering(reduce_window_min_p, partial(
     _reduce_window_lower, mlir.min_hlo, lax._get_min_identity))
 mlir.register_lowering(reduce_window_max_p, partial(
     _reduce_window_lower, mlir.max_hlo, lax._get_max_identity))
-
 
 
 def _select_and_scatter_shape_rule(
@@ -520,8 +686,8 @@ def _select_and_scatter_lower(
       operand,
       source,
       init_value,
-      window_dimensions=mlir.dense_int_elements(window_dimensions),
-      window_strides=mlir.dense_int_elements(window_strides),
+      window_dimensions=mlir.dense_int_array(window_dimensions),
+      window_strides=mlir.dense_int_array(window_strides),
       padding=ir.DenseIntElementsAttr.get(np.asarray(padding, np.int64),
                                           shape=(len(padding), 2)))
   select = op.select.blocks.append(scalar_type, scalar_type)
@@ -529,19 +695,21 @@ def _select_and_scatter_lower(
     if select_jaxpr.effects:
       raise NotImplementedError('Cannot lower effectful `select`.')
     out_nodes, _ = mlir.jaxpr_subcomp(ctx.module_context, select_jaxpr,
+                                      ctx.name_stack,
                                       mlir.TokenSet(), select_consts,
-                                      *([a] for a in select.arguments),
+                                      *select.arguments,
                                       dim_var_values=ctx.dim_var_values)
-    hlo.return_(util.flatten(out_nodes))
+    hlo.return_(mlir.flatten_ir_values(out_nodes))
   scatter = op.scatter.blocks.append(scalar_type, scalar_type)
   with ir.InsertionPoint(scatter):
     if scatter_jaxpr.effects:
       raise NotImplementedError('Cannot lower effectful `scatter`.')
     out_nodes, _ = mlir.jaxpr_subcomp(ctx.module_context, scatter_jaxpr,
+                                      ctx.name_stack,
                                       mlir.TokenSet(), scatter_consts,
-                                      *([a] for a in scatter.arguments),
+                                      *scatter.arguments,
                                       dim_var_values=ctx.dim_var_values)
-    hlo.return_(util.flatten(out_nodes))
+    hlo.return_(mlir.flatten_ir_values(out_nodes))
   return op.results
 
 mlir.register_lowering(select_and_scatter_p, _select_and_scatter_lower)
@@ -561,7 +729,7 @@ def _select_and_scatter_add_jvp(
       padding)
   del g_operand
   if type(g_source) is ad_util.Zero:
-    tangent_out = ad_util.Zero.from_value(val_out)
+    tangent_out = ad_util.Zero.from_primal_value(val_out)
   else:
     tangent_out = _select_and_scatter_add(
         g_source, operand, select_prim, window_dimensions,
@@ -651,8 +819,19 @@ def _select_and_gather_add_shape_rule(
            "got {} and {}.")
     raise TypeError(msg.format(tangents.shape, operand.shape))
   return _common_reduce_window_shape_rule(
-    operand, window_dimensions, window_strides, padding, base_dilation,
-    window_dilation)
+      operand, window_dimensions, window_strides, padding, base_dilation,
+      window_dilation)
+
+def _select_and_gather_add_sharding_rule(
+    tangents, operand, *, select_prim, window_dimensions, window_strides,
+    padding, base_dilation, window_dilation):
+  if tangents.sharding != operand.sharding:
+    raise TypeError(
+        "select_and_gather_add tangents and operand shardings must match, "
+        f"got {tangents.sharding} and {operand.sharding}.")
+  return reduce_window_sharding_rule(
+      operand, window_dimensions, window_strides, padding, base_dilation,
+      window_dilation)
 
 def _select_and_gather_add_lowering(
     ctx: mlir.LoweringRuleContext,
@@ -755,7 +934,9 @@ def _select_and_gather_add_lowering(
   double_word_out_aval = out_aval.update(dtype=double_word_dtype)
 
   def reducer_body(reducer: ir.Block) -> Sequence[ir.Value]:
-    x, y = reducer.arguments
+    x: ir.Value
+    y: ir.Value
+    x, y = reducer.arguments  # type: ignore
     assert select_prim is lax.ge_p or select_prim is lax.le_p
     cmp_op = "GE" if select_prim is lax.ge_p else "LE"
     out = hlo.SelectOp(mlir.compare_hlo(fst(x), fst(y), cmp_op), x, y)
@@ -804,7 +985,7 @@ def _select_and_gather_add_jvp(
       padding, base_dilation, window_dilation)
   del g_operand
   if type(g_source) is ad_util.Zero:
-    tangent_out = ad_util.Zero.from_value(val_out)
+    tangent_out = ad_util.Zero.from_primal_value(val_out)
   else:
     tangent_out = _select_and_gather_add(
         g_source, operand, select_prim, window_dimensions,
@@ -858,7 +1039,7 @@ def _select_and_gather_add_batching_rule(
 
 select_and_gather_add_p = lax.standard_primitive(
     _select_and_gather_add_shape_rule, lax._input_dtype,
-    'select_and_gather_add')
+    'select_and_gather_add', sharding_rule=_select_and_gather_add_sharding_rule)
 ad.primitive_jvps[select_and_gather_add_p] = _select_and_gather_add_jvp
 ad.primitive_transposes[select_and_gather_add_p] = \
   _select_and_gather_add_transpose
@@ -868,6 +1049,7 @@ batching.primitive_batchers[select_and_gather_add_p] = \
 mlir.register_lowering(select_and_gather_add_p, mlir.lower_fun(
     _select_and_gather_add_using_variadic_reducewindow,
     multiple_results=False))
+
 
 # TODO(b/183233858): use variadic reducewindow on GPU, when implemented.
 mlir.register_lowering(

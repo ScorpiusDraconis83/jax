@@ -17,11 +17,12 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Callable
 import gzip
 import itertools
 import json
 import types
-from typing import Any, Callable, Union
+from typing import Any, Iterator, Union
 
 from jax._src import core
 from jax._src import util
@@ -32,7 +33,7 @@ map, unsafe_map = util.safe_map, map
 zip, unsafe_zip = util.safe_zip, zip
 
 
-def all_eqns(jaxpr: core.Jaxpr):
+def all_eqns(jaxpr: core.Jaxpr) -> Iterator[tuple[core.Jaxpr, core.JaxprEqn]]:
   for eqn in jaxpr.eqns:
     yield (jaxpr, eqn)
   for subjaxpr in core.subjaxprs(jaxpr):
@@ -152,7 +153,7 @@ def _pprof_profile(
     else:
       raw_frames = zip(*tb.raw_frames())
       frames = [loc[(code, lasti)] for code, lasti in raw_frames
-                if source_info_util.is_user_filename(code.co_filename)]  # type: ignore
+                if source_info_util.is_user_filename(code.co_filename)]
     samples.append({
        "location_id": frames,
        "value": [count],

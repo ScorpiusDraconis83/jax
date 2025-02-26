@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Contains Triton specific Pallas functions."""
-try:
-  from jax._src.pallas import triton
-  get_compute_capability = triton.get_compute_capability
-  del triton
-except ImportError as e:
-  raise ImportError("Cannot import Pallas Triton backend. "
-                    "Make sure you've installed jax-triton.") from e
+from jax._src import deprecations
+
+deprecations.warn(
+    "pallas-gpu-triton",
+    "The ``jax.experimental.pallas.gpu`` submodule is deprecated. "
+    " Use ``jax.experimental.pallas.triton`` instead.",
+    stacklevel=1,
+)
+
+from jax.experimental.pallas.triton import *  # noqa: F403

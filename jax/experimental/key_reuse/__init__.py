@@ -16,30 +16,27 @@
 Experimental Key Reuse Checking
 -------------------------------
 
-This module contains **experimental** functionality for detecting re-use of random
-keys within JAX programs. It is under active development and the APIs here are likely
-to change.
+This module contains **experimental** functionality for detecting reuse of random
+keys within JAX programs. It is under active development and the APIs here are
+likely to change. The usage below requires JAX version 0.4.26 or newer.
 
-Key reuse checking can be enabled on `jit`-compiled functions using the
-:func:`jax.enable_key_reuse_checks` configuration::
+Key reuse checking can be enabled using the ``jax_debug_key_reuse`` configuration.
+This can be set globally using::
+
+  >>> jax.config.update('jax_debug_key_reuse', True)  # doctest: +SKIP
+
+Or it can be enabled locally with the :func:`jax.debug_key_reuse` context manager.
+When enabled, using the same key twice will result in a :class:`~jax.errors.KeyReuseError`::
 
   >>> import jax
-  >>> @jax.jit
-  ... def f(key):
-  ...   return jax.random.uniform(key) + jax.random.normal(key)
-  ...
-  >>> key = jax.random.key(0)
-  >>> with jax.enable_key_reuse_checks():
-  ...   f(key)  # doctest: +IGNORE_EXCEPTION_DETAIL
+  >>> with jax.debug_key_reuse(True):
+  ...   key = jax.random.key(0)
+  ...   val1 = jax.random.normal(key)
+  ...   val2 = jax.random.normal(key)  # doctest: +IGNORE_EXCEPTION_DETAIL
   Traceback (most recent call last):
    ...
-  KeyReuseError: In random_bits, key values a are already consumed.
+  KeyReuseError: Previously-consumed key passed to jit-compiled function at index 0
 
-This flag can also be set globally if you wish to enagle key reuse checks in
-every JIT-compiled function.
+The key reuse checker is currently experimental, but in the future we will likely
+enable it by default.
 """
-
-from jax.experimental.key_reuse._common import (
-    unconsumed_copy as unconsumed_copy,
-    KeyReuseError as KeyReuseError,
-)

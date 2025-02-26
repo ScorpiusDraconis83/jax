@@ -21,9 +21,9 @@ cross-platform lowering is tested in export_test.py.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import math
 import re
-from typing import Callable
 
 from absl import logging
 from absl.testing import absltest
@@ -31,39 +31,28 @@ from absl.testing import absltest
 import numpy as np
 
 import jax
+from jax import export
 from jax import lax
+from jax._src import config
 from jax._src import test_util as jtu
-from jax.experimental.export import export
 from jax._src.internal_test_util import test_harnesses
+from jax import random
 
 
 def make_disjunction_regexp(*parts: str) -> re.Pattern[str]:
-  return re.compile("(" + "|".join(parts) + ")")
+  if not parts:
+    return re.compile("matches_no_test")
+  else:
+    return re.compile("(" + "|".join(parts) + ")")
 
-# TODO(necula): Failures to be investigated (on GPU).
-_known_failures_gpu = make_disjunction_regexp(
-    # Failures due to failure to export custom call targets for GPU, these
-    # targets do not have backwards compatibility tests.
-    "custom_linear_solve_",
-    "lu_",
-    "svd_",
-    "tridiagonal_solve_",
-)
-
-# Some primitive lowering rules need the GPU backend to be able to create
-# CUDA lowering.
-_skip_cuda_lowering_unless_have_gpus = make_disjunction_regexp(
-    "svd_", "lu_", "eigh_", "qr_", "custom_linear_", "tridiagonal_solve_",
-    "random_",
-)
 
 class PrimitiveTest(jtu.JaxTestCase):
 
-  @classmethod
-  def setUpClass(cls):
+  def setUp(self):
+    super().setUp()
     # Pick one device from each available platform
-    cls.devices = []
-    cls.platforms = []
+    self.devices = []
+    self.platforms = []
     for backend in ["cpu", "gpu", "tpu"]:
       try:
         devices = jax.devices(backend)
@@ -71,10 +60,9 @@ class PrimitiveTest(jtu.JaxTestCase):
         devices = []
 
       for d in devices:
-        if d.platform not in cls.platforms:
-          cls.platforms.append(d.platform)
-          cls.devices.append(d)
-    super().setUpClass()
+        if d.platform not in self.platforms:
+          self.platforms.append(d.platform)
+          self.devices.append(d)
 
   # For each primitive we export for all platforms that are available and
   # compare the results of running the exported code and running the native
@@ -84,18 +72,21 @@ class PrimitiveTest(jtu.JaxTestCase):
   @test_harnesses.parameterized(
       test_harnesses.all_harnesses,
       include_jax_unimpl=False,
-      #one_containing="",
+      # one_containing="",
   )
   @jtu.ignore_warning(
       category=UserWarning,
       message=("Using reduced precision for gradient of reduce-window min/max "
                "operator to work around missing XLA support for pair-reductions")
   )
-  @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def test_prim(self, harness: test_harnesses.Harness):
+    if "eigh_" in harness.fullname:
+      self.skipTest("Eigenvalues are sorted and it is not correct to compare "
+                    "decompositions for equality.")
+
     if (jtu.device_under_test() == "gpu"
-        and _known_failures_gpu.search(harness.fullname)):
-      self.skipTest("failure to be investigated")
+        and "tridiagonal_solve_" in harness.fullname):
+      self.skipTest("tridiagonal_solve_ is not yet guaranteed stable.")
 
     if harness.params.get("enable_xla", False):
       self.skipTest("enable_xla=False is not relevant")
@@ -107,11 +98,14 @@ class PrimitiveTest(jtu.JaxTestCase):
     for l in harness.jax_unimplemented:
       if l.filter(dtype=harness.dtype):
         unimplemented_platforms = unimplemented_platforms.union(l.devices)
-    if (_skip_cuda_lowering_unless_have_gpus.search(harness.fullname)
+    # Some primitive lowering rules need the GPU backend to be able to create
+    # CUDA lowering.
+    if ("tridiagonal_solve_" in harness.fullname
         and all(d.platform != "gpu" for d in self.devices)):
       unimplemented_platforms.add("gpu")
 
-    logging.info("Harness is not implemented on %s", unimplemented_platforms)
+    if unimplemented_platforms:
+      logging.info("Harness is not implemented on %s", unimplemented_platforms)
 
     # Tolerances.
     tol = None
@@ -132,13 +126,16 @@ class PrimitiveTest(jtu.JaxTestCase):
       tol: float | None = None):
     devices = [
         d
-        for d in self.__class__.devices
+        for d in self.devices
         if d.platform not in unimplemented_platforms
     ]
     logging.info("Using devices %s", [str(d) for d in devices])
-    # lowering_platforms uses "cuda" instead of "gpu"
+    # lowering_platforms uses "cuda" or "rocm" instead of "gpu"
+    gpu_platform = "cuda"
+    if jtu.is_device_rocm():
+        gpu_platform = "rocm"
     lowering_platforms: list[str] = [
-        p if p != "gpu" else "cuda"
+        p if p != "gpu" else gpu_platform
         for p in ("cpu", "gpu", "tpu")
         if p not in unimplemented_platforms
     ]
@@ -149,19 +146,20 @@ class PrimitiveTest(jtu.JaxTestCase):
       )
 
     logging.info("Exporting harness for %s", lowering_platforms)
-    exp = export.export(func_jax, lowering_platforms=lowering_platforms)(*args)
+    exp = export.export(jax.jit(func_jax),
+                        platforms=lowering_platforms)(*args)
 
     for device in devices:
       if device.platform in skip_run_on_platforms:
         logging.info("Skipping running on %s", device)
         continue
-      device_args = jax.tree_util.tree_map(
+      device_args = jax.tree.map(
           lambda x: jax.device_put(x, device), args
       )
       logging.info("Running harness natively on %s", device)
-      native_res = func_jax(*device_args)
+      native_res = jax.jit(func_jax)(*device_args)
       logging.info("Running exported harness on %s", device)
-      exported_res = export.call_exported(exp)(*device_args)
+      exported_res = exp.call(*device_args)
       if tol is not None:
         logging.info(f"Using non-standard tolerance {tol}")
       self.assertAllClose(native_res, exported_res, atol=tol, rtol=tol)
@@ -192,6 +190,16 @@ class PrimitiveTest(jtu.JaxTestCase):
     if dtype == np.bool_:
       x = (x % 2).astype(np.bool_)
     self.export_and_compare_to_native(f, x)
+
+  def test_random_with_threefry_gpu_kernel_lowering(self):
+    # On GPU we use a custom call for threefry2x32
+    with config.threefry_gpu_kernel_lowering(True):
+      def f(x):
+        return random.gamma(random.key(42), x)
+
+      shape = (4, 5)
+      x = np.arange(math.prod(shape), dtype=np.float32).reshape(shape)
+      self.export_and_compare_to_native(f, x)
 
 
 if __name__ == "__main__":

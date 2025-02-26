@@ -150,6 +150,26 @@ class SvdTest(jtu.JaxTestCase):
       np.testing.assert_almost_equal(diff, 1E-4, decimal=2)
 
   @jtu.sample_product(
+      [dict(m=m, r=r) for m, r in zip([8, 8, 8, 10], [3, 5, 7, 9])],
+  )
+  def testSvdWithOnRankDeficientInputZeroColumns(self, m, r):
+    """Tests SVD with rank-deficient input."""
+    with jax.default_matmul_precision('float32'):
+      np.random.seed(1235)
+      a = np.random.randn(m, m).astype(_SVD_TEST_DTYPE)
+      d = np.ones(m).astype(_SVD_TEST_DTYPE)
+      d[r:m] = 0
+      a = a @ np.diag(d)
+
+      with jax.default_matmul_precision('float32'):
+        u, s, v = svd.svd(a, full_matrices=True, hermitian=False)
+      diff = np.linalg.norm(a - (u * s) @ v)
+      np.testing.assert_almost_equal(diff, 1e-4, decimal=2)
+      # Check that u and v are orthogonal.
+      self.assertAllClose(u.T.conj() @ u, np.eye(m), atol=10 * _SVD_TEST_EPS)
+      self.assertAllClose(v.T.conj() @ v, np.eye(m), atol=11 * _SVD_TEST_EPS)
+
+  @jtu.sample_product(
     [dict(m=m, n=n) for m, n in zip([2, 8, 10, 20], [4, 6, 10, 18])],
     log_cond=np.linspace(1, _MAX_LOG_CONDITION_NUM, 4),
     full_matrices=[True, False],
@@ -251,6 +271,42 @@ class SvdTest(jtu.JaxTestCase):
 
     self.assertAllClose(expected_s, jnp.real(actual_s), rtol=_SVD_RTOL,
                         atol=1E-6)
+
+  @jtu.sample_product(
+      start=[0, 1, 64, 126, 127],
+      end=[1, 2, 65, 127, 128],
+  )
+  @jtu.run_on_devices('tpu')  # TODO(rmlarsen: enable on other devices)
+  def testSvdSubsetByIndex(self, start, end):
+    if start >= end:
+      return
+    dtype = np.float32
+    m = 256
+    n = 128
+    rng = jtu.rand_default(self.rng())
+    tol = np.maximum(n, 80) * np.finfo(dtype).eps
+    args_maker = lambda: [rng((m, n), dtype)]
+    subset_by_index = (start, end)
+    k = end - start
+    (a,) = args_maker()
+
+    u, s, vt = jnp.linalg.svd(
+        a, full_matrices=False, subset_by_index=subset_by_index
+    )
+    self.assertEqual(u.shape, (m, k))
+    self.assertEqual(s.shape, (k,))
+    self.assertEqual(vt.shape, (k, n))
+
+    with jax.numpy_rank_promotion('allow'):
+      self.assertLessEqual(
+          np.linalg.norm(np.matmul(a, vt.T) - u * s), tol * np.linalg.norm(a)
+      )
+
+    # Test that we get the approximately the same singular values when
+    # slicing the full SVD.
+    _, full_s, _ = jnp.linalg.svd(a, full_matrices=False)
+    s_slice = full_s[start:end]
+    self.assertAllClose(s_slice, s, atol=tol, rtol=tol)
 
 
 if __name__ == '__main__':

@@ -26,11 +26,11 @@ customize this function as needed.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any, Callable, Optional, Union
+from collections.abc import Callable, Sequence
+from typing import Any
 
-from jax.experimental import jax2tf  # type: ignore[import]
-import tensorflow as tf  # type: ignore[import]
+from jax.experimental import jax2tf
+import tensorflow as tf
 
 
 def convert_and_save_model(
@@ -39,7 +39,7 @@ def convert_and_save_model(
     model_dir: str,
     *,
     input_signatures: Sequence[tf.TensorSpec],
-    polymorphic_shapes: str | jax2tf.PolyShape | None = None,
+    polymorphic_shapes: str | None = None,
     with_gradient: bool = False,
     enable_xla: bool = True,
     compile_model: bool = True,

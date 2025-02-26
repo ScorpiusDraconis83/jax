@@ -132,7 +132,7 @@ def f(token, x):
   return token, x
 ```
 If we rewrite `jax.print` to take in and return a token, we have now sequenced
-the two prints since the input to the second print depends is the output of the first print.
+the two prints since the input to the second print depends on the output of the first print.
 The actual value of `token` can be anything really, but we'll see in practice
 that the tokens are invisible to users.
 
@@ -154,7 +154,7 @@ def f(runtime_token, x):
 ```
 Notice how the runtime tokens are only used at the JIT boundary and the compiler tokens
 are only within the compiled code. Compiler tokens are created during
-"lowering" (we convert Python code to a lower level representation like HLO or MHLO)
+"lowering" (we convert Python code to a lower level representation like HLO or StableHLO)
 but runtime tokens need to be managed in Python since they're being threaded in and out
 of JIT-ted functions.
 
@@ -200,14 +200,14 @@ this copy is not necessary.
 
 ## Adding compiler tokens
 
-When we lower Python code to HLO or MHLO we need to create a token at the start of the computation and
+When we lower Python code to HLO or StableHLO we need to create a token at the start of the computation and
 ensure they are available when we have side-effecting computations that need to be ordered. The side-effecting
 computations will take the token as input and return it as an output.
 
 The implementation of this token threading involves upgrading the JAX lowering machinery to do
 this bookkeeping automatically.
 The main challenges involve dealing with higher-order primitives like call primitives
-and control-flow primitives. We won't go into details in how to handle those in this design note.
+and control-flow primitives. We won't go into details on how to handle those in this design note.
 
 ## Blocking on output tokens
 
