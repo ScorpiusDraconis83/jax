@@ -40,7 +40,7 @@ from jax._src.interpreters import partial_eval as pe
 from jax._src.lax import lax
 from jax._src.lax.utils import (
     _argnum_weak_type,
-    _input_dtype,
+    input_dtype,
     standard_primitive,
 )
 from jax._src.lib.mlir import ir
@@ -1451,7 +1451,7 @@ def _slice_batching_rule(batched_args, batch_dims, *, start_indices,
   out = slice(operand, new_start_indices, new_limit_indices, new_strides)
   return out, bdim
 
-slice_p = standard_primitive(_slice_shape_rule, _input_dtype, 'slice',
+slice_p = standard_primitive(_slice_shape_rule, input_dtype, 'slice',
                              sharding_rule=_slice_sharding_rule,
                              vma_rule=partial(core.standard_vma_rule, 'slice'))
 ad.deflinear2(slice_p, _slice_transpose_rule)
@@ -2694,6 +2694,12 @@ def _scatter_spec_computation(
   return None
 
 
+def _scatter_memory_space_rule(
+    operand, indices, updates, *, update_jaxpr, update_consts,
+    dimension_numbers, indices_are_sorted, unique_indices, mode):
+  return operand.memory_space
+
+
 def _scatter_sharding_rule(
     operand, indices, updates, *, update_jaxpr, update_consts,
     dimension_numbers, indices_are_sorted, unique_indices, mode):
@@ -2905,7 +2911,8 @@ def _scatter_batching_rule(scatter_op, axis_data, batched_args, batch_dims, *,
 scatter_add_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter-add',
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_scatter_sharding_rule,
-    vma_rule=partial(core.standard_vma_rule, 'scatter_add'))
+    vma_rule=partial(core.standard_vma_rule, 'scatter_add'),
+    memory_space_rule=_scatter_memory_space_rule)
 ad.primitive_jvps[scatter_add_p] = partial(_scatter_addsub_jvp, scatter_add_p)
 ad.primitive_transposes[scatter_add_p] = partial(_scatter_addsub_transpose_rule, scatter_add_p)
 batching.fancy_primitive_batchers[scatter_add_p] = partial(_scatter_batching_rule, scatter_add_p)
@@ -2914,7 +2921,8 @@ batching.skippable_batchers[scatter_add_p] = lambda _: ()
 scatter_sub_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter-sub',
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_scatter_sharding_rule,
-    vma_rule=partial(core.standard_vma_rule, 'scatter_sub')
+    vma_rule=partial(core.standard_vma_rule, 'scatter_sub'),
+    memory_space_rule=_scatter_memory_space_rule
 )
 ad.primitive_jvps[scatter_sub_p] = partial(_scatter_addsub_jvp, scatter_sub_p)
 ad.primitive_transposes[scatter_sub_p] = partial(_scatter_addsub_transpose_rule, scatter_sub_p)
@@ -2925,7 +2933,8 @@ batching.skippable_batchers[scatter_sub_p] = lambda _: ()
 scatter_mul_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter-mul',
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_scatter_sharding_rule,
-    vma_rule=partial(core.standard_vma_rule, 'scatter_mul'))
+    vma_rule=partial(core.standard_vma_rule, 'scatter_mul'),
+    memory_space_rule=_scatter_memory_space_rule)
 
 def _scatter_mul_jvp_rhs(g, x, i, y, *, dimension_numbers,
                          indices_are_sorted, unique_indices, mode, **kw):
@@ -3056,7 +3065,8 @@ def _scatter_extremal_jvp(scatter_op, primals, tangents, update_jaxpr,
 scatter_min_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter-min',
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_scatter_sharding_rule,
-    vma_rule=partial(core.standard_vma_rule, 'scatter_min'))
+    vma_rule=partial(core.standard_vma_rule, 'scatter_min'),
+    memory_space_rule=_scatter_memory_space_rule)
 batching.fancy_primitive_batchers[scatter_min_p] = (
   partial(_scatter_batching_rule, scatter_min_p))
 batching.skippable_batchers[scatter_min_p] = lambda _: ()
@@ -3065,7 +3075,8 @@ ad.primitive_jvps[scatter_min_p] = partial(_scatter_extremal_jvp, scatter_min_p)
 scatter_max_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter-max',
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_scatter_sharding_rule,
-    vma_rule=partial(core.standard_vma_rule, 'scatter_max'))
+    vma_rule=partial(core.standard_vma_rule, 'scatter_max'),
+    memory_space_rule=_scatter_memory_space_rule)
 batching.fancy_primitive_batchers[scatter_max_p] = (
   partial(_scatter_batching_rule, scatter_max_p))
 batching.skippable_batchers[scatter_max_p] = lambda _: ()
@@ -3124,7 +3135,7 @@ def _scatter_jvp(primals, tangents, *, update_jaxpr, update_consts,
   if core.is_constant_dim(num_ids):
     id_dtype = np.uint32 if (num_ids + 1) < np.iinfo(np.uint32).max else np.uint64
   else:
-    id_dtype = np.uint64
+    id_dtype = dtypes.canonicalize_dtype(np.uint64)
   update_ids = lax.add(lax.reshape(lax.iota(id_dtype, num_ids), ids_shape),
                        lax._ones(updates, dtype=id_dtype))
 
@@ -3225,7 +3236,8 @@ def _scatter_transpose_rule(t, operand, indices, updates, *,
 scatter_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter',
     weak_type_rule=_argnum_weak_type(0), sharding_rule=_scatter_sharding_rule,
-    vma_rule=partial(core.standard_vma_rule, 'scatter'))
+    vma_rule=partial(core.standard_vma_rule, 'scatter'),
+    memory_space_rule=_scatter_memory_space_rule)
 ad.primitive_jvps[scatter_p] = _scatter_jvp
 ad.primitive_transposes[scatter_p] = _scatter_transpose_rule
 batching.fancy_primitive_batchers[scatter_p] = (

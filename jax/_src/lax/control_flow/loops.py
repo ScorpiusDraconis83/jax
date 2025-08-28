@@ -540,6 +540,10 @@ def _empty_array(prefix, length_spec, aval):
   # empty = lax.empty((*prefix, *aval.shape), aval.dtype, out_sharding=sharding)
   # return core.pvary(empty, tuple(aval.vma))
   empty = core.pvary(lax.empty2(aval.dtype), tuple(aval.vma))
+  # TODO(yashkatariya): Make this more general by passing aval.memory_space to
+  # lax.broadcast and then remove this hack?
+  if aval.memory_space != core.typeof(empty).memory_space:
+    empty = api.device_put(empty, aval.memory_space)
   return lax.broadcast(empty, (*prefix, *aval.shape), out_sharding=sharding)
 
 eval_jaxpr_p = core.Primitive('eval_jaxpr')
@@ -1461,7 +1465,6 @@ def _scan_typecheck(bind_time, *in_atoms, reverse, length, num_consts,
 def _scan_state_partial_discharge_rule(
     should_discharge, in_avals, out_avals, *args, jaxpr, num_consts, num_carry,
     linear, unroll, reverse, length, _split_transpose):
-  if jaxpr.consts: raise NotImplementedError("open an issue!")  # TODO(mattjj)
   # jaxpr: [*consts, *pure_carry, *xs] -> [*pure_carry, *pure_ys]
   # jaxpr_: [*consts, *pure_carry, *xs] -> [*pure_carry, *pure_ys, *ref_outs]
   discharged_jaxpr = state_discharge.discharge_state2(jaxpr, should_discharge)

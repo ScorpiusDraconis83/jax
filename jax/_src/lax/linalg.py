@@ -775,14 +775,13 @@ def linalg_primitive(result_dtype, accepted_dtypes, ranks, result_shape, name,
     prim.def_abstract_eval(
       partial(lax_utils.standard_abstract_eval, prim, shape_rule, dtype_rule,
               lax_utils._standard_weak_type_rule, sharding_rule,
-              partial(core.standard_vma_rule, name),
-              None))
+              partial(core.standard_vma_rule, name), None, None))
   if supports_batching:
     batching.primitive_batchers[prim] = partial(
         batching.expand_dims_batcher, prim)
   return prim
 
-standard_linalg_primitive = partial(linalg_primitive, lax._input_dtype)
+standard_linalg_primitive = partial(linalg_primitive, lax.input_dtype)
 
 
 # Primitive implementations

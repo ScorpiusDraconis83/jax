@@ -20,7 +20,6 @@ from functools import partial
 
 from jax._src import core
 from jax._src import dispatch
-from jax._src import dtypes
 from jax._src import mesh as mesh_lib
 from jax._src import state
 from jax._src.named_sharding import DuplicateSpecError, NamedSharding
@@ -31,21 +30,22 @@ zip, unsafe_zip = safe_zip, zip
 
 import numpy as np
 
-def _input_dtype(x, *_, **__):
-  return dtypes.canonicalize_dtype(x.dtype, allow_extended_dtype=True)
+def input_dtype(x, *_, **__):
+  return x.dtype
 
 def _argnum_weak_type(*argnums):
   return lambda *args, **_: all(args[i].weak_type for i in argnums)
 
 def standard_primitive(shape_rule, dtype_rule, name,
                        weak_type_rule=None, sharding_rule=None, vma_rule=None,
-                       unreduced_rule=None):
+                       unreduced_rule=None, memory_space_rule=None):
   weak_type_rule = weak_type_rule or _standard_weak_type_rule
   prim = core.Primitive(name)
   prim.def_impl(partial(dispatch.apply_primitive, prim))
   prim.def_abstract_eval(
       partial(standard_abstract_eval, prim, shape_rule, dtype_rule,
-              weak_type_rule, sharding_rule, vma_rule, unreduced_rule))
+              weak_type_rule, sharding_rule, vma_rule, unreduced_rule,
+              memory_space_rule))
   return prim
 
 def _get_array_abstraction_level(a): return a.array_abstraction_level
@@ -141,7 +141,7 @@ def multi_mem_space_rule(prim, num_out, *avals, **kwargs):
 
 def standard_abstract_eval(prim, shape_rule, dtype_rule, weak_type_rule,
                            sharding_rule, vma_rule, unreduced_rule,
-                           *avals, **kwargs):
+                           memory_space_rule, *avals, **kwargs):
   for a in avals:
     if isinstance(a, state.AbstractRef):
       raise ValueError(f'Attempting to pass a Ref {a} to a primitive: '
@@ -159,7 +159,9 @@ def standard_abstract_eval(prim, shape_rule, dtype_rule, weak_type_rule,
         prim, shape_rule, dtype_rule, sharding_rule, unreduced_rule, False,
         *avals, **kwargs)
     out_vma = vma_rule(*avals, **kwargs)
-    out_mem_space = _default_memory_space_rule(prim, *avals, **kwargs)
+    out_mem_space = (_default_memory_space_rule(prim, *avals, **kwargs)
+                     if memory_space_rule is None else
+                     memory_space_rule(*avals, **kwargs))
     out_aval = core.ShapedArray(
         out_shape, out_dtype, weak_type=weak_type, sharding=out_sharding,
         vma=out_vma, memory_space=out_mem_space)
